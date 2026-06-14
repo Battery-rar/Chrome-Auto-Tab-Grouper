@@ -188,6 +188,47 @@ button.primary:hover {
   color: #047857;
 }
 
+.terminal-panel {
+  padding: 0;
+  overflow: hidden;
+}
+
+.terminal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.terminal-header h2 {
+  margin: 0;
+}
+
+.terminal-actions {
+  display: inline-flex;
+  gap: 8px;
+}
+
+.terminal-actions button {
+  height: 30px;
+  padding: 0 10px;
+}
+
+.terminal {
+  min-height: 180px;
+  max-height: 360px;
+  margin: 0;
+  padding: 14px 16px;
+  overflow: auto;
+  background: #10141b;
+  color: #d7e0ea;
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 @media (max-width: 640px) {
   .header {
     margin-bottom: 16px;
@@ -199,5 +240,10 @@ button.primary:hover {
 
   .segmented {
     width: 100%;
+  }
+
+  .terminal-header {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }

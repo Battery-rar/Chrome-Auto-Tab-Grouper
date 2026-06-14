@@ -1,6 +1,7 @@
 const SETTINGS_KEY = "autoTabGrouperSettings";
 const CACHE_KEY = "autoTabGrouperCloudCache";
 const LAST_STATUS_KEY = "autoTabGrouperLastStatus";
+const LOG_KEY = "autoTabGrouperLogs";
 
 const DEFAULT_SETTINGS = {
   mode: "local",
@@ -10,6 +11,12 @@ const DEFAULT_SETTINGS = {
   cloudModel: "",
   cacheTtlHours: 24
 };
+
+const CLOUD_TIMEOUT_MS = 60000;
+const CLOUD_MAX_OUTPUT_TOKENS = 4096;
+const MAX_LOG_ENTRIES = 120;
+const MAX_LOG_DETAIL_LENGTH = 5000;
+const WEAK_TITLE_GROUPS = new Set(["教程", "视频", "论文"]);
 
 const GROUP_COLORS = [
   "blue",
@@ -115,6 +122,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return;
     }
 
+    if (message?.type === "get-logs") {
+      sendResponse({ ok: true, logs: await getLogs() });
+      return;
+    }
+
+    if (message?.type === "clear-logs") {
+      await clearLogs();
+      sendResponse({ ok: true });
+      return;
+    }
+
     if (message?.type === "save-settings") {
       await setSettings({ ...(await getSettings()), ...message.settings });
       sendResponse({ ok: true });
@@ -134,21 +152,19 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
     if (message?.type === "test-cloud") {
       const settings = await getSettings();
-      const result = await classifyWithCloud(
-        [
-          {
+      const result = await classifyCandidateGroupsWithCloud(
+        buildCloudCandidates([
+          toClassifiableTab({
             id: 1,
             title: "React Documentation",
-            url: "https://react.dev/learn",
-            domain: "react.dev"
-          },
-          {
+            url: "https://react.dev/learn"
+          }),
+          toClassifiableTab({
             id: 2,
             title: "OpenAI API Reference",
-            url: "https://platform.openai.com/docs/api-reference",
-            domain: "openai.com"
-          }
-        ],
+            url: "https://platform.openai.com/docs/api-reference"
+          })
+        ]),
         settings,
         true
       );
@@ -239,6 +255,7 @@ async function classifyTabs(tabs, settings) {
       return { items: await classifyTabsWithCache(tabs, settings), warning: "" };
     } catch (error) {
       const warning = `云端分类失败，已回退到本地域名模式：${normalizeError(error)}`;
+      await appendLog("error", "云端分类失败，回退本地规则", normalizeError(error));
       await setBadge("error");
       return {
         items: tabs.map((tab) => ({
@@ -270,17 +287,29 @@ async function classifyTabsWithCache(tabs, settings) {
   const cached = cache[batchKey];
 
   if (cached && now - cached.at < cacheTtl && cached.groups) {
+    await appendLog("info", "命中云端分类缓存", { tabs: tabs.length, cacheKey: batchKey });
     return tabs.map((tab) => ({
       tab,
       group: cached.groups[getTabSignature(tab)] || getLocalGroup(tab)
     }));
   }
 
-  const cloudResults = await classifyWithCloud(items, settings);
-  const groupsById = new Map(cloudResults.map((result) => [result.id, result.group]));
+  const candidates = buildCloudCandidates(items);
+  await appendLog("info", "准备云端分类", {
+    tabs: tabs.length,
+    candidates: candidates.length,
+    candidateSummary: summarizeCandidates(candidates)
+  });
+  const cloudResults = candidates.length > 0
+    ? await classifyCandidateGroupsWithCloud(candidates, settings)
+    : [];
+  const candidateGroups = new Map(cloudResults.map((result) => [result.candidateId, result.group]));
+  const candidateByTabId = new Map(
+    candidates.flatMap((candidate) => candidate.tabIds.map((id) => [id, candidate]))
+  );
   const classified = tabs.map((tab) => ({
     tab,
-    group: groupsById.get(tab.id) || getLocalGroup(tab)
+    group: candidateGroups.get(candidateByTabId.get(tab.id)?.candidateId) || getLocalGroup(tab)
   }));
 
   cache[batchKey] = {
@@ -292,7 +321,7 @@ async function classifyTabsWithCache(tabs, settings) {
   return classified;
 }
 
-async function classifyWithCloud(items, settings, isTest = false) {
+async function classifyCandidateGroupsWithCloud(candidates, settings, isTest = false) {
   assertCloudSettings(settings);
 
   const apiUrl = settings.cloudApiUrl.trim();
@@ -301,18 +330,26 @@ async function classifyWithCloud(items, settings, isTest = false) {
     "Content-Type": "application/json",
     Authorization: `Bearer ${settings.cloudApiKey.trim()}`
   };
+  const requestMeta = {
+    endpoint: safeEndpoint(apiUrl),
+    endpointType: isResponsesEndpoint ? "responses" : "chat-completions",
+    model: settings.cloudModel.trim(),
+    candidates: candidates.length
+  };
 
   const systemPrompt = [
     "你是浏览器标签页分类器。",
-    "你必须对整批标签页一起分组，不能把每个标签页孤立分类。",
-    "为每个标签页分配一个简短中文分组名，并按以下多层机制判断：",
-    "1. 名字/标题层：优先看标题里的主题、产品、技术栈、教程对象。不同网站、不同域名但标题主题相同的标签必须归到同一组。例如 YouTube、知乎、博客里的 Rime、小狼毫、鼠须管、雾凇拼音教程都归为 Rime，而不是视频、社交或各自域名。",
+    "不要输出推理过程，不要逐项解释，不要先分析；直接输出最终 JSON。",
+    "你会收到本地预处理后的候选组摘要，而不是完整标签列表。你的任务是合并候选组并给最终分组智能命名。",
+    "必须按以下多层机制判断：",
+    "1. 名字/标题层：优先看标题里的主题、产品、技术栈、教程对象。不同网站、不同域名但标题主题相同的候选组必须合并到同一组。例如 YouTube、知乎、博客里的 Rime、小狼毫、鼠须管、雾凇拼音教程都归为 Rime 输入法，而不是视频、社交或各自域名。",
     "2. 网站属性层：如果标题没有明确共同主题，再看网站属性，例如视频、代码、文档、邮箱、搜索、购物、社交、新闻、金融、设计、办公。",
     "3. 站点名层：如果仍不能判断，才使用站点名或产品名，例如 GitHub、Notion、Google Docs、哔哩哔哩。",
-    "智能命名要求：组名要尽量具体、稳定、可复用；有具体主题时用主题名，不要用笼统的“教程”“文章”；有具体产品时用产品名，不要用网站类型。",
+    "智能命名要求：组名要尽量具体、稳定、可复用；有具体主题时用主题名或主题+类别，例如 Rime 输入法、React 文档、OpenAI API，不要用笼统的“教程”“文章”；有具体产品时用产品名，不要用网站类型。",
     "不要把完整域名或域名后缀作为分组名，例如不要返回 bilibili.com、example.xyz、docs.example.co.uk。",
-    "分组名最长 12 个中文字符。必须为每个输入 id 返回且只返回一次。",
-    "只返回 JSON，不要解释。格式：{\"items\":[{\"id\":123,\"group\":\"开发\"}]}。"
+    "分组名最长 12 个中文字符。必须覆盖每个输入 candidateId，且每个 candidateId 只能出现在一个返回组里。",
+    "输出必须是纯 JSON 对象，不能包含 Markdown、代码块、解释文字或前后缀。",
+    "唯一允许格式：{\"groups\":[{\"candidateIds\":[\"c1\",\"c2\"],\"group\":\"Rime 输入法\"}]}。"
   ].join("\n");
 
   const userPrompt = JSON.stringify({
@@ -321,75 +358,181 @@ async function classifyWithCloud(items, settings, isTest = false) {
       useProvidedSignalsAsHints: true,
       avoidDomainSuffixInGroupNames: true
     },
-    tabs: items.map((item) => ({
-      id: item.id,
-      title: item.title || "",
-      url: item.url || "",
-      domain: item.domain || getDomainGroup(item.url),
+    candidates: candidates.map((candidate) => ({
+      candidateId: candidate.candidateId,
+      tabIds: candidate.tabIds,
+      suggestedName: candidate.suggestedName,
+      sampleTitles: candidate.sampleTitles,
+      urlHints: candidate.urlHints,
+      domains: candidate.domains,
       signals: {
-        titleTopic: item.titleTopic || "",
-        siteProperty: item.siteProperty || "",
-        domainDisplayName: item.domainDisplayName || "",
-        localFallback: item.localFallback || ""
+        titleTopics: candidate.titleTopics,
+        siteProperties: candidate.siteProperties,
+        domainDisplayNames: candidate.domainDisplayNames
       }
     }))
   });
 
-  const body = isResponsesEndpoint
-    ? {
-        model: settings.cloudModel.trim(),
-        input: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt }
-        ],
-        temperature: 0.1,
-        text: { format: { type: "json_object" } }
-      }
-    : {
-        model: settings.cloudModel.trim(),
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt }
-        ],
-        temperature: 0.1,
-        response_format: { type: "json_object" }
-      };
-
-  const response = await fetch(apiUrl, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body)
-  });
-
-  if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(`HTTP ${response.status}: ${detail.slice(0, 200)}`);
+  let data;
+  try {
+    await appendLog("info", "发送云端请求", { ...requestMeta, jsonMode: true });
+    data = await postCloudJson(apiUrl, headers, buildCloudRequestBody({
+      isResponsesEndpoint,
+      model: settings.cloudModel.trim(),
+      systemPrompt,
+      userPrompt,
+      useJsonMode: true
+    }));
+  } catch (error) {
+    if (!isLikelyJsonModeError(error)) {
+      throw error;
+    }
+    await appendLog("warn", "JSON mode 不兼容，重试普通提示模式", normalizeError(error));
+    await appendLog("info", "发送云端请求", { ...requestMeta, jsonMode: false });
+    data = await postCloudJson(apiUrl, headers, buildCloudRequestBody({
+      isResponsesEndpoint,
+      model: settings.cloudModel.trim(),
+      systemPrompt,
+      userPrompt,
+      useJsonMode: false
+    }));
   }
 
-  const data = await response.json();
+  await appendLog("debug", "云端响应 JSON", data);
+  assertCloudCompletionUsable(data);
   const content = extractModelContent(data);
-  const parsed = parseJsonObject(content);
-  const resultItems = Array.isArray(parsed.items) ? parsed.items : [];
+  await appendLog("ai", "AI 返回内容", content);
+  const parsed = parseModelJson(content);
+  const resultGroups = normalizeResultGroups(parsed);
+  await appendLog("info", "AI 分组解析结果", resultGroups);
 
-  if (isTest && resultItems.length === 0) {
-    throw new Error("API 返回成功，但没有 items 分类结果。");
+  if (isTest && resultGroups.length === 0) {
+    throw new Error("API 返回成功，但没有 groups 分类结果。");
   }
 
-  return resultItems
-    .map((item) => ({
-      id: Number(item.id),
-      group: normalizeReturnedGroupName(item.group)
-    }))
-    .filter((item) => Number.isInteger(item.id) && item.group);
+  return resultGroups.flatMap((group) => {
+    const groupName = normalizeReturnedGroupName(group.group);
+    const candidateIds = getCandidateIdsFromGroup(group);
+    return candidateIds
+      .map((candidateId) => ({
+        candidateId: String(candidateId),
+        group: groupName
+      }))
+      .filter((item) => item.candidateId && item.group);
+  });
+}
+
+function buildCloudRequestBody({ isResponsesEndpoint, model, systemPrompt, userPrompt, useJsonMode }) {
+  if (isResponsesEndpoint) {
+    return {
+      model,
+      input: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt }
+      ],
+      temperature: 0.1,
+      max_output_tokens: CLOUD_MAX_OUTPUT_TOKENS,
+      ...(useJsonMode ? { text: { format: { type: "json_object" } } } : {}),
+      extra_body: { thinking: { type: "disabled" } }
+    };
+  }
+
+  return {
+    model,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt }
+    ],
+    temperature: 0.1,
+    max_tokens: CLOUD_MAX_OUTPUT_TOKENS,
+    ...(useJsonMode ? { response_format: { type: "json_object" } } : {}),
+    extra_body: { thinking: { type: "disabled" } }
+  };
+}
+
+async function postCloudJson(apiUrl, headers, body) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), CLOUD_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(apiUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error("云端分类超过 1 分钟，已停止等待。");
+    }
+    throw new Error(`请求失败: ${normalizeError(error)}`);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  const responseText = typeof response.text === "function"
+    ? await response.text()
+    : JSON.stringify(await response.json());
+  await appendLog("debug", "云端 HTTP 响应", {
+    status: response.status,
+    ok: response.ok,
+    textPreview: truncateString(responseText, 1200)
+  });
+  if (!response.ok) {
+    const error = new Error(`HTTP ${response.status}: ${responseText.slice(0, 400)}`);
+    error.status = response.status;
+    error.responseText = responseText;
+    throw error;
+  }
+
+  try {
+    return JSON.parse(responseText);
+  } catch {
+    return { output_text: responseText };
+  }
+}
+
+function isLikelyJsonModeError(error) {
+  const message = normalizeError(error).toLowerCase();
+  return /response_format|json_object|json mode|text\.format|text format|unsupported.*json|invalid.*format|schema/.test(message);
+}
+
+function assertCloudCompletionUsable(data) {
+  const choice = data?.choices?.[0];
+  const finishReason = choice?.finish_reason;
+  const content = choice?.message?.content;
+  const reasoningContent = choice?.message?.reasoning_content;
+
+  if (finishReason === "length" && !String(content || "").trim() && String(reasoningContent || "").trim()) {
+    throw new Error("模型把输出 token 消耗在 reasoning_content，最终 content 为空；这通常是 DeepSeek 等推理模型的输出预算耗尽。");
+  }
 }
 
 function extractModelContent(data) {
-  if (typeof data?.output_text === "string") {
+  if (typeof data?.output_text === "string" && data.output_text.trim()) {
     return data.output_text;
   }
 
+  if (typeof data?.text === "string" && data.text.trim()) {
+    return data.text;
+  }
+
+  if (typeof data?.content === "string" && data.content.trim()) {
+    return data.content;
+  }
+
+  const topLevelContent = extractTextFromContentParts(data?.content);
+  if (topLevelContent) {
+    return topLevelContent;
+  }
+
   const responseText = data?.output?.flatMap((outputItem) => outputItem.content || [])
-    .map((contentItem) => contentItem.text)
+    .map((contentItem) => {
+      if (typeof contentItem === "string") {
+        return contentItem;
+      }
+      return contentItem?.text || contentItem?.content || "";
+    })
     .filter(Boolean)
     .join("\n");
   if (responseText) {
@@ -397,22 +540,228 @@ function extractModelContent(data) {
   }
 
   const chatContent = data?.choices?.[0]?.message?.content;
-  if (typeof chatContent === "string") {
+  if (typeof chatContent === "string" && chatContent.trim()) {
     return chatContent;
+  }
+
+  const chatContentParts = extractTextFromContentParts(chatContent);
+  if (chatContentParts) {
+    return chatContentParts;
+  }
+
+  const choiceText = data?.choices?.[0]?.text;
+  if (typeof choiceText === "string" && choiceText.trim()) {
+    return choiceText;
+  }
+
+  const messageContent = data?.message?.content;
+  if (typeof messageContent === "string" && messageContent.trim()) {
+    return messageContent;
+  }
+
+  const messageContentParts = extractTextFromContentParts(messageContent);
+  if (messageContentParts) {
+    return messageContentParts;
   }
 
   throw new Error("无法读取模型返回内容。");
 }
 
-function parseJsonObject(text) {
-  const trimmed = String(text || "").trim();
-  const unwrapped = trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
-  const start = unwrapped.indexOf("{");
-  const end = unwrapped.lastIndexOf("}");
-  if (start === -1 || end === -1 || end <= start) {
-    throw new Error("模型没有返回 JSON 对象。");
+function extractTextFromContentParts(content) {
+  if (!Array.isArray(content)) {
+    return "";
   }
-  return JSON.parse(unwrapped.slice(start, end + 1));
+  return content.map((part) => {
+    if (typeof part === "string") {
+      return part;
+    }
+    return part?.text || part?.content || part?.value || "";
+  }).filter(Boolean).join("\n");
+}
+
+function parseModelJson(text) {
+  const candidates = getJsonCandidates(text);
+  for (const candidate of candidates) {
+    const parsed = tryParseJson(candidate);
+    if (parsed) {
+      return normalizeParsedJson(parsed);
+    }
+  }
+  throw new Error("模型没有返回可解析的 JSON。");
+}
+
+function getJsonCandidates(text) {
+  const raw = String(text || "").trim();
+  const candidates = [raw];
+  const codeBlocks = [...raw.matchAll(/```(?:json|javascript|js)?\s*([\s\S]*?)```/gi)]
+    .map((match) => match[1].trim())
+    .filter(Boolean);
+  candidates.push(...codeBlocks);
+
+  const objectCandidate = extractBalancedJson(raw, "{", "}");
+  if (objectCandidate) {
+    candidates.push(objectCandidate);
+  }
+
+  const arrayCandidate = extractBalancedJson(raw, "[", "]");
+  if (arrayCandidate) {
+    candidates.push(arrayCandidate);
+  }
+
+  return [...new Set(candidates.filter(Boolean))];
+}
+
+function tryParseJson(text) {
+  const normalized = normalizeJsonLikeText(text);
+  const quotedKeys = normalized.replace(/([{,]\s*)([A-Za-z_$][\w$-]*)(\s*:)/g, '$1"$2"$3');
+  const doubleQuoted = normalized.replace(/'/g, '"');
+  const quotedKeysAndStrings = quotedKeys.replace(/'/g, '"');
+  const attempts = [
+    normalized,
+    normalized.replace(/,\s*([}\]])/g, "$1"),
+    quotedKeys.replace(/,\s*([}\]])/g, "$1"),
+    doubleQuoted.replace(/,\s*([}\]])/g, "$1"),
+    quotedKeysAndStrings.replace(/,\s*([}\]])/g, "$1")
+  ];
+
+  for (const attempt of attempts) {
+    try {
+      return JSON.parse(attempt);
+    } catch {
+      // Try the next recovery strategy.
+    }
+  }
+  return null;
+}
+
+function normalizeJsonLikeText(text) {
+  return String(text || "")
+    .trim()
+    .replace(/^\uFEFF/, "")
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/：/g, ":")
+    .replace(/，/g, ",")
+    .replace(/（/g, "(")
+    .replace(/）/g, ")")
+    .replace(/【/g, "[")
+    .replace(/】/g, "]")
+    .replace(/；/g, ";");
+}
+
+function extractBalancedJson(text, openChar, closeChar) {
+  const start = text.indexOf(openChar);
+  if (start === -1) {
+    return "";
+  }
+
+  let depth = 0;
+  let inString = false;
+  let quote = "";
+  let escaped = false;
+
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === quote) {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"' || char === "'") {
+      inString = true;
+      quote = char;
+      continue;
+    }
+
+    if (char === openChar) {
+      depth += 1;
+    } else if (char === closeChar) {
+      depth -= 1;
+      if (depth === 0) {
+        return text.slice(start, index + 1);
+      }
+    }
+  }
+
+  return "";
+}
+
+function normalizeParsedJson(parsed) {
+  if (Array.isArray(parsed)) {
+    return { groups: parsed };
+  }
+  if (Array.isArray(parsed?.groups)) {
+    return parsed;
+  }
+  if (Array.isArray(parsed?.items)) {
+    return { groups: parsed.items };
+  }
+  if (parsed?.candidateIds || parsed?.group) {
+    return { groups: [parsed] };
+  }
+  return parsed || {};
+}
+
+function normalizeResultGroups(parsed) {
+  if (Array.isArray(parsed?.groups)) {
+    return parsed.groups;
+  }
+
+  if (parsed && typeof parsed === "object") {
+    const entries = Object.entries(parsed);
+    const looksLikeCandidateMap = entries.length > 0 && entries.every(([key, value]) => {
+      return /^c\d+$/i.test(key) && typeof value === "string";
+    });
+    if (looksLikeCandidateMap) {
+      return entries.map(([candidateId, group]) => ({
+        candidateIds: [candidateId],
+        group
+      }));
+    }
+  }
+
+  return [];
+}
+
+function getCandidateIdsFromGroup(group) {
+  if (Array.isArray(group.candidateIds)) {
+    return group.candidateIds;
+  }
+  if (Array.isArray(group.ids)) {
+    return group.ids;
+  }
+  if (Array.isArray(group.candidates)) {
+    return group.candidates;
+  }
+  if (group.candidateId) {
+    return [group.candidateId];
+  }
+  if (group.id && /^c\d+$/i.test(String(group.id))) {
+    return [group.id];
+  }
+  return [];
+}
+
+function compactUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const path = parsed.pathname && parsed.pathname !== "/" ? parsed.pathname : "";
+    return truncateString(`${parsed.hostname}${path}`, 120);
+  } catch {
+    return truncateString(url, 120);
+  }
+}
+
+function truncateString(value, maxLength) {
+  const text = String(value || "");
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
 }
 
 function toClassifiableTab(tab) {
@@ -429,6 +778,87 @@ function toClassifiableTab(tab) {
     domainDisplayName,
     localFallback: titleTopic || siteProperty || domainDisplayName
   };
+}
+
+function buildCloudCandidates(items) {
+  const candidateMap = new Map();
+
+  for (const item of items) {
+    const key = getCandidateKey(item);
+    if (!candidateMap.has(key)) {
+      candidateMap.set(key, {
+        candidateId: `c${candidateMap.size + 1}`,
+        suggestedName: item.localFallback || item.domainDisplayName || "其他",
+        tabIds: [],
+        sampleTitles: [],
+        urlHints: [],
+        domains: new Set(),
+        titleTopics: new Set(),
+        siteProperties: new Set(),
+        domainDisplayNames: new Set()
+      });
+    }
+
+    const candidate = candidateMap.get(key);
+    candidate.tabIds.push(item.id);
+    pushUnique(candidate.sampleTitles, truncateString(item.title || "", 80), 3);
+    pushUnique(candidate.urlHints, compactUrl(item.url || ""), 3);
+    addNonEmpty(candidate.domains, item.domain);
+    addNonEmpty(candidate.titleTopics, item.titleTopic);
+    addNonEmpty(candidate.siteProperties, item.siteProperty);
+    addNonEmpty(candidate.domainDisplayNames, item.domainDisplayName);
+  }
+
+  return [...candidateMap.values()].map((candidate) => ({
+    ...candidate,
+    domains: [...candidate.domains].slice(0, 4),
+    titleTopics: [...candidate.titleTopics].slice(0, 4),
+    siteProperties: [...candidate.siteProperties].slice(0, 4),
+    domainDisplayNames: [...candidate.domainDisplayNames].slice(0, 4)
+  }));
+}
+
+function summarizeCandidates(candidates) {
+  return candidates.slice(0, 20).map((candidate) => ({
+    candidateId: candidate.candidateId,
+    tabCount: candidate.tabIds.length,
+    suggestedName: candidate.suggestedName,
+    titleTopics: candidate.titleTopics,
+    siteProperties: candidate.siteProperties,
+    domainDisplayNames: candidate.domainDisplayNames,
+    sampleTitles: candidate.sampleTitles
+  }));
+}
+
+function safeEndpoint(url) {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return url;
+  }
+}
+
+function getCandidateKey(item) {
+  if (item.titleTopic && !WEAK_TITLE_GROUPS.has(item.titleTopic)) {
+    return `topic:${item.titleTopic}`;
+  }
+  if (item.siteProperty && !item.titleTopic) {
+    return `property:${item.siteProperty}`;
+  }
+  return `tab:${item.id}`;
+}
+
+function pushUnique(list, value, maxLength) {
+  if (value && !list.includes(value) && list.length < maxLength) {
+    list.push(value);
+  }
+}
+
+function addNonEmpty(set, value) {
+  if (value) {
+    set.add(value);
+  }
 }
 
 function isGroupableTab(tab) {
@@ -648,6 +1078,45 @@ function trimCache(cache, now, ttl) {
     .filter(([, value]) => (value?.group || value?.groups) && now - Number(value.at || 0) < ttl)
     .slice(-500);
   return Object.fromEntries(entries);
+}
+
+async function appendLog(level, message, detail = "") {
+  try {
+    const logs = await getLogs();
+    logs.push({
+      at: Date.now(),
+      level,
+      message,
+      detail: formatLogDetail(detail)
+    });
+    await setStorage(LOG_KEY, logs.slice(-MAX_LOG_ENTRIES));
+  } catch {
+    // Logging must never break tab grouping.
+  }
+}
+
+async function getLogs() {
+  return (await getStorage(LOG_KEY)) || [];
+}
+
+async function clearLogs() {
+  await setStorage(LOG_KEY, []);
+}
+
+function formatLogDetail(detail) {
+  if (detail === undefined || detail === null || detail === "") {
+    return "";
+  }
+  const text = typeof detail === "string"
+    ? detail
+    : JSON.stringify(detail, null, 2);
+  return truncateString(redactSensitiveText(text), MAX_LOG_DETAIL_LENGTH);
+}
+
+function redactSensitiveText(text) {
+  return String(text || "")
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/g, "Bearer [redacted]")
+    .replace(/sk-[A-Za-z0-9._-]+/g, "sk-[redacted]");
 }
 
 function assertCloudSettings(settings) {

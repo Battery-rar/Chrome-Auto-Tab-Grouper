@@ -4,14 +4,19 @@ const fields = {
   cloudApiKey: document.querySelector("#cloudApiKey"),
   cloudModel: document.querySelector("#cloudModel"),
   cacheTtlHours: document.querySelector("#cacheTtlHours"),
-  status: document.querySelector("#status")
+  status: document.querySelector("#status"),
+  logTerminal: document.querySelector("#logTerminal")
 };
 
 document.querySelector("#save").addEventListener("click", saveSettings);
 document.querySelector("#testCloud").addEventListener("click", testCloud);
 document.querySelector("#regroupNow").addEventListener("click", regroupNow);
+document.querySelector("#refreshLogs").addEventListener("click", refreshLogs);
+document.querySelector("#clearLogs").addEventListener("click", clearLogs);
 
 loadSettings();
+refreshLogs();
+setInterval(refreshLogs, 3000);
 
 async function loadSettings() {
   const response = await sendMessage({ type: "get-settings" });
@@ -59,11 +64,12 @@ async function testCloud() {
   setStatus("正在测试云端分类…", true);
   const response = await sendMessage({ type: "test-cloud" });
   if (response.ok) {
-    const groups = response.result.map((item) => `${item.id}: ${item.group}`).join("；");
+    const groups = response.result.map((item) => `${item.candidateId}: ${item.group}`).join("；");
     setStatus(`云端分类可用：${groups || "已返回结果"}`, true);
   } else {
     setStatus(response.error || "云端分类测试失败。", false);
   }
+  await refreshLogs();
 }
 
 async function regroupNow() {
@@ -75,6 +81,28 @@ async function regroupNow() {
     setStatus(message || `已整理 ${groupedTabs} 个标签，生成 ${groups} 个分组。`, !warning);
   } else {
     setStatus(response.error || "立即分组失败。", false);
+  }
+  await refreshLogs();
+}
+
+async function refreshLogs() {
+  const response = await sendMessage({ type: "get-logs" });
+  if (!response.ok) {
+    fields.logTerminal.textContent = response.error || "读取日志失败。";
+    return;
+  }
+
+  const logs = response.logs || [];
+  fields.logTerminal.textContent = logs.length ? logs.map(formatLogEntry).join("\n\n") : "暂无日志。";
+  fields.logTerminal.scrollTop = fields.logTerminal.scrollHeight;
+}
+
+async function clearLogs() {
+  const response = await sendMessage({ type: "clear-logs" });
+  if (response.ok) {
+    await refreshLogs();
+  } else {
+    setStatus(response.error || "清空日志失败。", false);
   }
 }
 
@@ -95,4 +123,11 @@ function setStatus(message, ok) {
   fields.status.textContent = message;
   fields.status.classList.toggle("ok", Boolean(ok));
   fields.status.classList.toggle("error", ok === false);
+}
+
+function formatLogEntry(entry) {
+  const time = entry.at ? new Date(entry.at).toLocaleTimeString() : "--:--:--";
+  const level = String(entry.level || "info").toUpperCase().padEnd(5, " ");
+  const detail = entry.detail ? `\n${entry.detail}` : "";
+  return `[${time}] ${level} ${entry.message || ""}${detail}`;
 }

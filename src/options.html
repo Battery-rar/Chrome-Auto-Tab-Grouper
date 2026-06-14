@@ -53,7 +53,7 @@
             <input id="cacheTtlHours" type="number" min="1" max="720" step="1">
           </label>
         </div>
-        <p class="hint">云端模式会优先按标题里的主题分类，再看网站属性，最后才用域名兜底。它会把标签页标题、URL 和域名发送到你配置的 API 链接。</p>
+        <p class="hint">云端模式会先本地识别明确主题，只把不确定的标签交给 AI。发送内容包括标题、域名、站点名和截短后的 URL 线索。</p>
       </section>
 
       <section class="actions">
@@ -63,6 +63,17 @@
       </section>
 
       <p id="status" class="status" role="status"></p>
+
+      <section class="panel terminal-panel">
+        <div class="terminal-header">
+          <h2>日志终端</h2>
+          <div class="terminal-actions">
+            <button id="refreshLogs" type="button">刷新</button>
+            <button id="clearLogs" type="button">清空</button>
+          </div>
+        </div>
+        <pre id="logTerminal" class="terminal" aria-live="polite">暂无日志。</pre>
+      </section>
     </main>
 
     <script src="options.js"></script>
