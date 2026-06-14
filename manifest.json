@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Auto Tab Grouper",
-  "version": "0.4.9",
+  "version": "0.5.5",
   "description": "点击后按标题、网站属性、域名或 AI 分类整理 Chrome 标签页分组。",
   "minimum_chrome_version": "114",
   "permissions": [

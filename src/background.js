@@ -17,200 +17,31 @@ const CLOUD_TIMEOUT_MS = 60000;
 const CLOUD_MAX_OUTPUT_TOKENS = 4096;
 const MAX_LOG_ENTRIES = 120;
 const MAX_LOG_DETAIL_LENGTH = 5000;
-const WEAK_TITLE_GROUPS = new Set(["教程", "视频", "论文", "文档", "API"]);
+loadRuleDefinitions();
 
-const GROUP_COLORS = [
-  "blue",
-  "red",
-  "yellow",
-  "green",
-  "pink",
-  "purple",
-  "cyan",
-  "orange",
-  "grey"
-];
+const {
+  WEAK_TITLE_GROUPS,
+  FUNCTIONAL_TOPIC_STOP_WORDS,
+  SOURCE_NAME_PATTERN,
+  GROUP_COLORS,
+  DOMAIN_DISPLAY_NAMES,
+  PRODUCT_DOMAIN_GROUPS,
+  TITLE_TOPIC_RULES,
+  SITE_PROPERTY_RULES,
+  MULTI_PART_TLDS
+} = globalThis.AUTO_TAB_GROUPER_RULES;
 
-const DOMAIN_DISPLAY_NAMES = new Map([
-  ["developer.chrome.com", "Chrome 开发者"],
-  ["chromewebstore.google.com", "Chrome 商店"],
-  ["apps.apple.com", "App Store"],
-  ["developer.apple.com", "Apple 开发者"],
-  ["appstoreconnect.apple.com", "App Store Connect"],
-  ["github.com", "GitHub"],
-  ["gitlab.com", "GitLab"],
-  ["gitee.com", "Gitee"],
-  ["stackoverflow.com", "Stack Overflow"],
-  ["stackexchange.com", "Stack Exchange"],
-  ["npmjs.com", "npm"],
-  ["pypi.org", "PyPI"],
-  ["crates.io", "crates.io"],
-  ["csdn.net", "CSDN"],
-  ["blog.csdn.net", "CSDN"],
-  ["download.csdn.net", "CSDN"],
-  ["google.com", "Google"],
-  ["youtube.com", "YouTube"],
-  ["youtu.be", "YouTube"],
-  ["bilibili.com", "哔哩哔哩"],
-  ["b23.tv", "哔哩哔哩"],
-  ["bilibili.tv", "哔哩哔哩"],
-  ["biliblii.com", "哔哩哔哩"],
-  ["openai.com", "OpenAI"],
-  ["platform.openai.com", "OpenAI API"],
-  ["chatgpt.com", "ChatGPT"],
-  ["anthropic.com", "Anthropic"],
-  ["claude.ai", "Claude"],
-  ["deepseek.com", "DeepSeek"],
-  ["chat.deepseek.com", "DeepSeek"],
-  ["platform.deepseek.com", "DeepSeek API"],
-  ["moonshot.cn", "Kimi"],
-  ["kimi.moonshot.cn", "Kimi"],
-  ["qwen.ai", "通义千问"],
-  ["tongyi.com", "通义千问"],
-  ["doubao.com", "豆包"],
-  ["volcengine.com", "火山引擎"],
-  ["gemini.google.com", "Gemini"],
-  ["grok.com", "Grok"],
-  ["poe.com", "Poe"],
-  ["huggingface.co", "Hugging Face"],
-  ["notion.so", "Notion"],
-  ["obsidian.md", "Obsidian"],
-  ["figma.com", "Figma"],
-  ["framer.com", "Framer"],
-  ["canva.com", "Canva"],
-  ["linear.app", "Linear"],
-  ["slack.com", "Slack"],
-  ["discord.com", "Discord"],
-  ["vercel.com", "Vercel"],
-  ["supabase.com", "Supabase"],
-  ["netlify.com", "Netlify"],
-  ["x.com", "X"],
-  ["twitter.com", "Twitter"],
-  ["reddit.com", "Reddit"],
-  ["zhihu.com", "知乎"],
-  ["weibo.com", "微博"],
-  ["xiaohongshu.com", "小红书"],
-  ["taobao.com", "淘宝"],
-  ["tmall.com", "天猫"],
-  ["jd.com", "京东"],
-  ["amazon.com", "Amazon"],
-  ["amazon.cn", "Amazon"],
-  ["baidu.com", "百度"],
-  ["bing.com", "Bing"],
-  ["duckduckgo.com", "DuckDuckGo"],
-  ["perplexity.ai", "Perplexity"],
-  ["medium.com", "Medium"],
-  ["sspai.com", "少数派"],
-  ["36kr.com", "36氪"],
-  ["thepaper.cn", "澎湃新闻"],
-  ["nytimes.com", "NYTimes"],
-  ["reuters.com", "Reuters"],
-  ["bbc.com", "BBC"],
-  ["tradingview.com", "TradingView"],
-  ["coursera.org", "Coursera"],
-  ["udemy.com", "Udemy"],
-  ["edx.org", "edX"],
-  ["khanacademy.org", "Khan Academy"],
-  ["macdown.uranusjr.com", "MacDown"],
-  ["macdown.uranusjr.com.cn", "MacDown"]
-]);
-
-const TITLE_TOPIC_RULES = [
-  { group: "Rime 输入法", pattern: /\b(rime|librime|weasel|squirrel|trime|ibus-rime)\b|小狼毫|鼠须管|中州韵|雾凇拼音|薄荷拼音|朙月拼音|地球拼音|仓颉输入法|输入法方案/ },
-  { group: "Chrome 扩展", pattern: /chrome\s*(extension|web store)|manifest\s*v?3|mv3|浏览器扩展|扩展程序|chrome 应用商店|chrome 商店/ },
-  { group: "OpenAI API", pattern: /\b(openai|chatgpt|gpt-[45]|responses api|assistants api)\b.*\b(api|sdk|model|模型)\b|\b(api|sdk)\b.*\b(openai|gpt-[45])\b/ },
-  { group: "OpenAI", pattern: /\b(openai|chatgpt|gpt-[45]|responses api|assistants api)\b/ },
-  { group: "Claude", pattern: /\b(claude|anthropic)\b/ },
-  { group: "DeepSeek API", pattern: /\bdeepseek\b.*\b(api|sdk|model|模型)\b|\b(api|sdk)\b.*\bdeepseek\b|deepseek.*接口/ },
-  { group: "DeepSeek", pattern: /\bdeepseek\b|深度求索/ },
-  { group: "Kimi", pattern: /\bkimi\b|moonshot|月之暗面/ },
-  { group: "通义千问", pattern: /\bqwen\b|通义千问|通义\b/ },
-  { group: "豆包", pattern: /\bdoubao\b|豆包|火山方舟/ },
-  { group: "Gemini", pattern: /\bgemini\b|google ai studio/ },
-  { group: "Grok", pattern: /\bgrok\b/ },
-  { group: "Perplexity", pattern: /\bperplexity\b/ },
-  { group: "Hugging Face", pattern: /\bhugging\s*face\b|transformers|diffusers/ },
-  { group: "Midjourney", pattern: /\bmidjourney\b/ },
-  { group: "Stable Diffusion", pattern: /\bstable diffusion\b|\bsdxl\b|comfyui|automatic1111/ },
-  { group: "大模型", pattern: /\bllm\b|大语言模型|提示词|prompt engineering|rag\b|向量数据库|embedding|推理模型/ },
-  { group: "Cursor", pattern: /\bcursor\b/ },
-  { group: "VS Code", pattern: /\b(vs ?code|visual studio code)\b/ },
-  { group: "React", pattern: /\breact(?:\.js)?\b/ },
-  { group: "Vue", pattern: /\bvue(?:\.js)?\b/ },
-  { group: "Next.js", pattern: /\bnext(?:\.js)?\b/ },
-  { group: "Nuxt", pattern: /\bnuxt(?:\.js)?\b/ },
-  { group: "Svelte", pattern: /\bsvelte(?:kit)?\b/ },
-  { group: "Angular", pattern: /\bangular\b/ },
-  { group: "Astro", pattern: /\bastro\b/ },
-  { group: "Tailwind CSS", pattern: /\btailwind(?:css)?\b/ },
-  { group: "TypeScript", pattern: /\btypescript|tsconfig\b/ },
-  { group: "JavaScript", pattern: /\bjavascript|node\.js|npm|pnpm|yarn|bun\b/ },
-  { group: "Python", pattern: /\bpython|pyenv|pip|conda|jupyter|fastapi|django|flask\b/ },
-  { group: "Rust", pattern: /\brust|cargo|tokio|tauri\b/ },
-  { group: "Go", pattern: /\bgolang\b|\bgo语言\b/ },
-  { group: "Swift", pattern: /\bswift|swiftui|xcode\b/ },
-  { group: "HarmonyOS", pattern: /harmonyos|鸿蒙|arkts|arkui|deveco/ },
-  { group: "Docker", pattern: /\bdocker|dockerfile|docker compose|compose\.ya?ml\b/ },
-  { group: "Kubernetes", pattern: /\bkubernetes|k8s|kubectl|helm\b/ },
-  { group: "Git", pattern: /\bgit\b|版本控制/ },
-  { group: "PostgreSQL", pattern: /\bpostgres(?:ql)?\b/ },
-  { group: "Supabase", pattern: /\bsupabase\b/ },
-  { group: "Redis", pattern: /\bredis\b/ },
-  { group: "MongoDB", pattern: /\bmongodb|mongo\b/ },
-  { group: "API", pattern: /\b(rest api|graphql|grpc|openapi|swagger|webhook)\b|接口文档/ },
-  { group: "macOS", pattern: /\bmacos|launchd|homebrew|brew\b|快捷指令|自动操作/ },
-  { group: "Windows", pattern: /\bwindows|powershell|wsl\b/ },
-  { group: "Linux", pattern: /\blinux|ubuntu|debian|archlinux|systemd\b/ },
-  { group: "Markdown", pattern: /\bmarkdown|mdx\b/ },
-  { group: "Obsidian", pattern: /\bobsidian\b/ },
-  { group: "Notion", pattern: /\bnotion\b/ },
-  { group: "LaTeX", pattern: /\blatex|overleaf\b/ },
-  { group: "MacDown", pattern: /\bmacdown\b/ },
-  { group: "MarkEdit", pattern: /\bmarkedit\b/ },
-  { group: "论文", pattern: /论文|paper|arxiv|doi\.org|research/ },
-  { group: "文档", pattern: /文档|documentation|docs|manual|reference|手册/ },
-  { group: "教程", pattern: /教程|入门|指南|guide|tutorial|learn/ },
-  { group: "视频", pattern: /视频|直播|回放|\bvideo\b|\blive\b/ }
-];
-
-const SITE_PROPERTY_RULES = [
-  { group: "AI", domains: ["chat.openai.com", "chatgpt.com", "openai.com", "platform.openai.com", "claude.ai", "anthropic.com", "deepseek.com", "chat.deepseek.com", "platform.deepseek.com", "kimi.moonshot.cn", "moonshot.cn", "qwen.ai", "tongyi.com", "doubao.com", "volcengine.com", "gemini.google.com", "aistudio.google.com", "grok.com", "poe.com", "perplexity.ai", "huggingface.co"] },
-  { group: "文档", domains: ["developer.mozilla.org", "docs.github.com", "learn.microsoft.com", "devdocs.io", "readthedocs.io", "developer.chrome.com", "developer.apple.com", "platform.openai.com", "docs.anthropic.com", "docs.cursor.com", "docs.deepseek.com", "react.dev", "vuejs.org", "nextjs.org", "nuxt.com", "svelte.dev", "astro.build", "tailwindcss.com", "vite.dev", "nodejs.org", "docs.python.org", "doc.rust-lang.org", "go.dev", "developer.harmonyos.com"] },
-  { group: "代码", domains: ["github.com", "gitlab.com", "bitbucket.org", "gitee.com", "stackoverflow.com", "stackexchange.com", "npmjs.com", "pypi.org", "crates.io", "pkg.go.dev"] },
-  { group: "视频", domains: ["youtube.com", "youtu.be", "bilibili.com", "b23.tv", "bilibili.tv", "vimeo.com", "netflix.com", "iqiyi.com", "youku.com", "tencentvideo.com", "douyin.com", "tiktok.com", "kuaishou.com"] },
-  { group: "邮箱", domains: ["mail.google.com", "outlook.live.com", "outlook.office.com", "mail.qq.com", "mail.163.com", "mail.126.com"] },
-  { group: "应用商店", domains: ["chromewebstore.google.com", "apps.apple.com", "appstoreconnect.apple.com"] },
-  { group: "办公", domains: ["notion.so", "docs.google.com", "drive.google.com", "office.com", "feishu.cn", "larksuite.com", "yuque.com", "linear.app", "slack.com"] },
-  { group: "设计", domains: ["figma.com", "dribbble.com", "behance.net", "canva.com", "framer.com"] },
-  { group: "学习", domains: ["coursera.org", "udemy.com", "edx.org", "khanacademy.org", "leetcode.com", "freecodecamp.org"] },
-  { group: "部署", domains: ["vercel.com", "netlify.com", "cloudflare.com", "render.com", "railway.app"] },
-  { group: "购物", domains: ["amazon.com", "amazon.cn", "taobao.com", "tmall.com", "jd.com", "pinduoduo.com", "1688.com", "ebay.com"] },
-  { group: "社交", domains: ["x.com", "twitter.com", "facebook.com", "instagram.com", "reddit.com", "weibo.com", "zhihu.com", "xiaohongshu.com", "discord.com"] },
-  { group: "新闻", domains: ["news.ycombinator.com", "nytimes.com", "bbc.com", "reuters.com", "thepaper.cn", "36kr.com", "sspai.com"] },
-  { group: "金融", domains: ["finance.yahoo.com", "tradingview.com", "bloomberg.com", "eastmoney.com", "xueqiu.com"] },
-  { group: "搜索", domains: ["google.com", "bing.com", "baidu.com", "duckduckgo.com"] }
-];
-
-const MULTI_PART_TLDS = new Set([
-  "co.uk",
-  "org.uk",
-  "ac.uk",
-  "gov.uk",
-  "com.cn",
-  "net.cn",
-  "org.cn",
-  "gov.cn",
-  "com.au",
-  "net.au",
-  "org.au",
-  "co.jp",
-  "co.kr",
-  "com.br",
-  "com.mx",
-  "com.sg",
-  "com.hk",
-  "com.tw"
-]);
+function loadRuleDefinitions() {
+  if (globalThis.AUTO_TAB_GROUPER_RULES) {
+    return;
+  }
+  if (typeof importScripts === "function") {
+    importScripts("rules.js");
+  }
+  if (!globalThis.AUTO_TAB_GROUPER_RULES) {
+    throw new Error("分类规则未加载。");
+  }
+}
 
 chrome.runtime.onInstalled.addListener(async () => {
   const settings = await getSettings();
@@ -310,33 +141,13 @@ async function regroupWindow(windowId) {
 
   const classification = await classifyTabs(tabs, settings);
   const classified = stabilizeSingletonsByDomain(classification.items, settings);
-  const groups = new Map();
-
-  for (const item of classified) {
-    if (!item.group) {
-      continue;
-    }
-    const groupName = truncateGroupTitle(item.group);
-    if (!groups.has(groupName)) {
-      groups.set(groupName, []);
-    }
-    groups.get(groupName).push(item.tab.id);
-  }
 
   let groupCount = 0;
   let groupedTabs = 0;
-  const eligibleGroups = [...groups.entries()].filter(([, tabIds]) => {
-    return settings.includeSingleTabGroups || tabIds.length >= 2;
-  });
-  eligibleGroups.sort(([left], [right]) => left.localeCompare(right, "zh-Hans-CN"));
-  const groupedTabIdsInOrder = eligibleGroups.flatMap(([, tabIds]) => tabIds);
+  const { eligibleGroups, groupedTabIdsInOrder } = buildEligibleTabGroups(classified, settings);
   const groupedStartIndex = getFirstGroupableTabIndex(tabs);
-  const groupedTabIdSet = new Set(groupedTabIdsInOrder);
-  const staleGroupedTabIds = tabs
-    .filter((tab) => isTabInGroup(tab) && !groupedTabIdSet.has(tab.id))
-    .map((tab) => tab.id);
 
-  await ungroupTabIds(staleGroupedTabIds);
+  await ungroupTabIds(getStaleGroupedTabIds(tabs, groupedTabIdsInOrder));
 
   const createdGroups = [];
   for (const [groupName, tabIds] of eligibleGroups) {
@@ -377,31 +188,94 @@ async function regroupWindow(windowId) {
   return { groupedTabs, groups: groupCount, message: status.message, warning: classification.warning };
 }
 
+function buildEligibleTabGroups(classified, settings) {
+  const groups = new Map();
+
+  for (const item of classified) {
+    if (!item.group) {
+      continue;
+    }
+    const groupName = truncateGroupTitle(item.group);
+    if (!groups.has(groupName)) {
+      groups.set(groupName, []);
+    }
+    groups.get(groupName).push(item.tab.id);
+  }
+
+  const eligibleGroups = [...groups.entries()]
+    .filter(([, tabIds]) => settings.includeSingleTabGroups || tabIds.length >= 2)
+    .sort(([left], [right]) => left.localeCompare(right, "zh-Hans-CN"));
+
+  return {
+    eligibleGroups,
+    groupedTabIdsInOrder: eligibleGroups.flatMap(([, tabIds]) => tabIds)
+  };
+}
+
+function getStaleGroupedTabIds(tabs, groupedTabIds) {
+  const groupedTabIdSet = new Set(groupedTabIds);
+  return tabs
+    .filter((tab) => isTabInGroup(tab) && !groupedTabIdSet.has(tab.id))
+    .map((tab) => tab.id);
+}
+
 async function classifyTabs(tabs, settings) {
   if (settings.mode === "cloud") {
     try {
       return { items: await classifyTabsWithCache(tabs, settings), warning: "" };
     } catch (error) {
-      const warning = `云端分类失败，已回退到本地域名模式：${normalizeError(error)}`;
+      const warning = `云端分类失败，已回退到本地规则：${normalizeError(error)}`;
       await appendLog("error", "云端分类失败，回退本地规则", normalizeError(error));
       await setBadge("error");
       return {
-        items: tabs.map((tab) => ({
-          tab,
-          group: getLocalGroup(tab)
-        })),
+        items: classifyLocalTabs(tabs),
         warning
       };
     }
   }
 
   return {
-    items: tabs.map((tab) => ({
-      tab,
-      group: getLocalGroup(tab)
-    })),
+    items: classifyLocalTabs(tabs),
     warning: ""
   };
+}
+
+function classifyLocalTabs(tabs) {
+  const { items } = buildClassifiableItems(tabs);
+  return items.map((item) => ({
+    tab: item.tab,
+    group: item.localFallback
+  }));
+}
+
+function getFunctionalContextGroupByTabId(tabs) {
+  const buckets = new Map();
+
+  for (const tab of tabs) {
+    const topic = getFunctionalTopic(tab);
+    if (!topic) {
+      continue;
+    }
+    const key = normalizeTopicKey(topic);
+    if (!key) {
+      continue;
+    }
+    if (!buckets.has(key)) {
+      buckets.set(key, { group: topic, tabs: [] });
+    }
+    buckets.get(key).tabs.push(tab);
+  }
+
+  const groupByTabId = new Map();
+  for (const bucket of buckets.values()) {
+    if (bucket.tabs.length < 2) {
+      continue;
+    }
+    for (const tab of bucket.tabs) {
+      groupByTabId.set(tab.id, bucket.group);
+    }
+  }
+  return groupByTabId;
 }
 
 function stabilizeSingletonsByDomain(items, settings) {
@@ -465,7 +339,7 @@ async function classifyTabsWithCache(tabs, settings) {
   const now = Date.now();
   const cacheTtl = Math.max(1, Number(settings.cacheTtlHours || DEFAULT_SETTINGS.cacheTtlHours)) * 60 * 60 * 1000;
   const cache = (await getStorage(CACHE_KEY)) || {};
-  const items = tabs.map(toClassifiableTab);
+  const { items, localFallbackByTabId } = buildClassifiableItems(tabs);
   const batchKey = getCloudBatchCacheKey(items);
   const cached = cache[batchKey];
 
@@ -473,7 +347,7 @@ async function classifyTabsWithCache(tabs, settings) {
     await appendLog("info", "命中云端分类缓存", { tabs: tabs.length, cacheKey: batchKey });
     return tabs.map((tab) => ({
       tab,
-      group: cached.groups[getTabSignature(tab)] || getLocalGroup(tab)
+      group: cached.groups[getTabSignature(tab)] || localFallbackByTabId.get(tab.id) || getLocalGroup(tab)
     }));
   }
 
@@ -492,7 +366,7 @@ async function classifyTabsWithCache(tabs, settings) {
   );
   const classified = tabs.map((tab) => ({
     tab,
-    group: candidateGroups.get(candidateByTabId.get(tab.id)?.candidateId) || getLocalGroup(tab)
+    group: candidateGroups.get(candidateByTabId.get(tab.id)?.candidateId) || localFallbackByTabId.get(tab.id) || getLocalGroup(tab)
   }));
 
   cache[batchKey] = {
@@ -524,11 +398,15 @@ async function classifyCandidateGroupsWithCloud(candidates, settings, isTest = f
     "你是浏览器标签页分类器。",
     "不要输出推理过程，不要逐项解释，不要先分析；直接输出最终 JSON。",
     "你会收到本地预处理后的候选组摘要，而不是完整标签列表。你的任务是合并候选组并给最终分组智能命名。",
+    "每个候选组有 confidence：high 表示本地已有明确功能主题、明确产品/技术主题或官方产品域名信号，通常应保留其主题；medium/low 表示只是弱标题、网站属性或普通域名兜底，必须进一步阅读标题、URL、域名和信号来判断是否能合并成更具体的功能组。",
     "必须按以下多层机制判断：",
     "1. 名字/标题层：优先看标题里的主题、产品、技术栈、教程对象。不同网站、不同域名但标题主题相同的候选组必须合并到同一组。例如 YouTube、知乎、博客里的 Rime、小狼毫、鼠须管、雾凇拼音教程都归为 Rime 输入法，而不是视频、社交或各自域名。",
-    "2. 网站属性层：如果标题没有明确共同主题，再看网站属性，例如视频、代码、文档、邮箱、搜索、购物、社交、新闻、金融、设计、办公。",
-    "3. 站点名层：如果仍不能判断，才使用站点名或产品名，例如 GitHub、Notion、Google Docs、哔哩哔哩。",
+    "2. 功能上下文层：教程、下载、安装、配置、部署、文档、release、GitHub 项目页如果围绕同一个对象，应合并为该对象或对象+用途，例如 Python、Foo 工具、Rime 输入法、Ollama。本地大模型教程、Ollama 下载页、Open WebUI/Ollama 相关文档如果明显围绕 Ollama，应合并到 Ollama 或 Ollama 工具链。",
+    "3. 产品域名层：preferredDomainGroups 表示官网、文档站或下载页对应的产品名，例如 Ollama、Open WebUI、Dify。它比泛化的网站属性 AI、文档、办公更具体。",
+    "4. 网站属性层：如果标题没有明确共同主题，再看网站属性，例如视频、代码、文档、邮箱、搜索、购物、社交、新闻、金融、设计、办公。",
+    "5. 站点名层：如果仍不能判断，才使用站点名，例如 GitHub、Google Docs、哔哩哔哩、CSDN。",
     "智能命名要求：组名要尽量具体、稳定、可复用；有具体主题时用主题名或主题+类别，例如 Rime 输入法、React 文档、OpenAI API，不要用笼统的“教程”“文章”；有具体产品时用产品名，不要用网站类型。",
+    "不要机械保留 suggestedName；medium/low 的候选尤其要重新分析。只有功能联系弱或证据不足时，才按站点名或域名兜底分组。",
     "不要把完整域名或域名后缀作为分组名，例如不要返回 bilibili.com、example.xyz、docs.example.co.uk。",
     "分组名最长 12 个中文字符。必须覆盖每个输入 candidateId，且每个 candidateId 只能出现在一个返回组里。",
     "输出必须是纯 JSON 对象，不能包含 Markdown、代码块、解释文字或前后缀。",
@@ -537,7 +415,7 @@ async function classifyCandidateGroupsWithCloud(candidates, settings, isTest = f
 
   const userPrompt = JSON.stringify({
     rules: {
-      priority: ["titleTopic", "siteProperty", "domainDisplayName"],
+      priority: ["functionalTopic", "titleTopic", "preferredDomainGroup", "siteProperty", "domainDisplayName"],
       useProvidedSignalsAsHints: true,
       avoidDomainSuffixInGroupNames: true
     },
@@ -545,11 +423,14 @@ async function classifyCandidateGroupsWithCloud(candidates, settings, isTest = f
       candidateId: candidate.candidateId,
       tabIds: candidate.tabIds,
       suggestedName: candidate.suggestedName,
+      confidence: candidate.confidence,
       sampleTitles: candidate.sampleTitles,
       urlHints: candidate.urlHints,
       domains: candidate.domains,
       signals: {
+        functionalTopics: candidate.functionalTopics,
         titleTopics: candidate.titleTopics,
+        preferredDomainGroups: candidate.preferredDomainGroups,
         siteProperties: candidate.siteProperties,
         domainDisplayNames: candidate.domainDisplayNames
       }
@@ -999,20 +880,55 @@ function truncateString(value, maxLength) {
   return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
 }
 
-function toClassifiableTab(tab) {
+function buildClassifiableItems(tabs) {
+  const functionalContextByTabId = getFunctionalContextGroupByTabId(tabs);
+  const items = tabs.map((tab) => ({
+    ...toClassifiableTab(tab, functionalContextByTabId.get(tab.id)),
+    tab
+  }));
+  return {
+    items,
+    localFallbackByTabId: new Map(items.map((item) => [item.id, item.localFallback]))
+  };
+}
+
+function toClassifiableTab(tab, functionalTopic = "") {
   const titleTopic = getTitleGroup(tab.title || "", tab.url || "");
   const siteProperty = getSitePropertyGroup(tab.url || "");
   const domainDisplayName = getDomainName(tab.url);
+  const preferredDomainGroup = getPreferredDomainGroup(tab.url || "");
+  const localFallback = functionalTopic || chooseLocalGroup({
+    titleTopic,
+    siteProperty,
+    domainDisplayName,
+    preferredDomainGroup
+  });
   return {
     id: tab.id,
     title: tab.title || "",
     url: tab.url || "",
     domain: getDomainGroup(tab.url),
+    functionalTopic,
     titleTopic,
     siteProperty,
     domainDisplayName,
-    localFallback: chooseLocalGroup(titleTopic, siteProperty, domainDisplayName)
+    preferredDomainGroup,
+    localFallback,
+    confidence: getLocalSignalConfidence({ functionalTopic, titleTopic, siteProperty, domainDisplayName, preferredDomainGroup })
   };
+}
+
+function getLocalSignalConfidence({ functionalTopic, titleTopic, siteProperty, domainDisplayName, preferredDomainGroup }) {
+  if (functionalTopic || preferredDomainGroup || (titleTopic && !WEAK_TITLE_GROUPS.has(titleTopic))) {
+    return "high";
+  }
+  if (siteProperty || titleTopic) {
+    return "medium";
+  }
+  if (domainDisplayName) {
+    return "low";
+  }
+  return "unknown";
 }
 
 function buildCloudCandidates(items) {
@@ -1021,36 +937,75 @@ function buildCloudCandidates(items) {
   for (const item of items) {
     const key = getCandidateKey(item);
     if (!candidateMap.has(key)) {
-      candidateMap.set(key, {
-        candidateId: `c${candidateMap.size + 1}`,
-        suggestedName: item.localFallback || item.domainDisplayName || "其他",
-        tabIds: [],
-        sampleTitles: [],
-        urlHints: [],
-        domains: new Set(),
-        titleTopics: new Set(),
-        siteProperties: new Set(),
-        domainDisplayNames: new Set()
-      });
+      candidateMap.set(key, createCloudCandidate(candidateMap.size + 1, item));
     }
 
     const candidate = candidateMap.get(key);
-    candidate.tabIds.push(item.id);
-    pushUnique(candidate.sampleTitles, truncateString(item.title || "", 80), 3);
-    pushUnique(candidate.urlHints, compactUrl(item.url || ""), 3);
-    addNonEmpty(candidate.domains, item.domain);
-    addNonEmpty(candidate.titleTopics, item.titleTopic);
-    addNonEmpty(candidate.siteProperties, item.siteProperty);
-    addNonEmpty(candidate.domainDisplayNames, item.domainDisplayName);
+    addItemToCloudCandidate(candidate, item);
   }
 
-  return [...candidateMap.values()].map((candidate) => ({
+  return [...candidateMap.values()].map(finalizeCloudCandidate);
+}
+
+function createCloudCandidate(index, item) {
+  return {
+    candidateId: `c${index}`,
+    suggestedName: item.localFallback || item.domainDisplayName || "其他",
+    tabIds: [],
+    sampleTitles: [],
+    urlHints: [],
+    domains: new Set(),
+        functionalTopics: new Set(),
+        titleTopics: new Set(),
+        preferredDomainGroups: new Set(),
+        siteProperties: new Set(),
+    domainDisplayNames: new Set(),
+    confidences: new Set()
+  };
+}
+
+function addItemToCloudCandidate(candidate, item) {
+  candidate.tabIds.push(item.id);
+  pushUnique(candidate.sampleTitles, truncateString(item.title || "", 80), 3);
+  pushUnique(candidate.urlHints, compactUrl(item.url || ""), 3);
+  addNonEmpty(candidate.domains, item.domain);
+  addNonEmpty(candidate.functionalTopics, item.functionalTopic);
+  addNonEmpty(candidate.titleTopics, item.titleTopic);
+  addNonEmpty(candidate.preferredDomainGroups, item.preferredDomainGroup);
+  addNonEmpty(candidate.siteProperties, item.siteProperty);
+  addNonEmpty(candidate.domainDisplayNames, item.domainDisplayName);
+  addNonEmpty(candidate.confidences, item.confidence);
+}
+
+function finalizeCloudCandidate(candidate) {
+  return {
     ...candidate,
-    domains: [...candidate.domains].slice(0, 4),
-    titleTopics: [...candidate.titleTopics].slice(0, 4),
-    siteProperties: [...candidate.siteProperties].slice(0, 4),
-    domainDisplayNames: [...candidate.domainDisplayNames].slice(0, 4)
-  }));
+    domains: setToArray(candidate.domains, 4),
+    functionalTopics: setToArray(candidate.functionalTopics, 4),
+    titleTopics: setToArray(candidate.titleTopics, 4),
+    preferredDomainGroups: setToArray(candidate.preferredDomainGroups, 4),
+    siteProperties: setToArray(candidate.siteProperties, 4),
+    domainDisplayNames: setToArray(candidate.domainDisplayNames, 4),
+    confidence: summarizeCandidateConfidence(candidate.confidences)
+  };
+}
+
+function setToArray(set, maxLength) {
+  return [...set].slice(0, maxLength);
+}
+
+function summarizeCandidateConfidence(confidences) {
+  const values = confidences instanceof Set ? [...confidences] : [];
+  if (values.includes("high")) {
+    return "high";
+  }
+  if (values.includes("medium")) {
+    return "medium";
+  }
+  if (values.includes("low")) {
+    return "low";
+  }
+  return "unknown";
 }
 
 function summarizeCandidates(candidates) {
@@ -1058,7 +1013,10 @@ function summarizeCandidates(candidates) {
     candidateId: candidate.candidateId,
     tabCount: candidate.tabIds.length,
     suggestedName: candidate.suggestedName,
+    confidence: candidate.confidence,
+    functionalTopics: candidate.functionalTopics,
     titleTopics: candidate.titleTopics,
+    preferredDomainGroups: candidate.preferredDomainGroups,
     siteProperties: candidate.siteProperties,
     domainDisplayNames: candidate.domainDisplayNames,
     sampleTitles: candidate.sampleTitles
@@ -1075,11 +1033,11 @@ function safeEndpoint(url) {
 }
 
 function getCandidateKey(item) {
-  if (item.titleTopic && !WEAK_TITLE_GROUPS.has(item.titleTopic)) {
-    return `topic:${item.titleTopic}`;
-  }
-  if (item.siteProperty && (!item.titleTopic || WEAK_TITLE_GROUPS.has(item.titleTopic))) {
-    return `property:${item.siteProperty}`;
+  const strongGroup = item.functionalTopic
+    || (item.titleTopic && !WEAK_TITLE_GROUPS.has(item.titleTopic) ? item.titleTopic : "")
+    || item.preferredDomainGroup;
+  if (strongGroup) {
+    return `strong:${normalizeTopicKey(strongGroup)}`;
   }
   return `tab:${item.id}`;
 }
@@ -1112,24 +1070,34 @@ function getLocalGroup(tab) {
   const titleGroup = getTitleGroup(tab.title || "", tab.url || "");
   const siteGroup = getSitePropertyGroup(tab.url || "");
   const domainGroup = getDomainName(tab.url);
+  const preferredDomainGroup = getPreferredDomainGroup(tab.url || "");
 
-  return chooseLocalGroup(titleGroup, siteGroup, domainGroup);
+  return chooseLocalGroup({
+    titleTopic: titleGroup,
+    siteProperty: siteGroup,
+    domainDisplayName: domainGroup,
+    preferredDomainGroup
+  });
 }
 
-function chooseLocalGroup(titleGroup, siteGroup, domainGroup) {
-  if (titleGroup && !WEAK_TITLE_GROUPS.has(titleGroup)) {
-    return titleGroup;
+function chooseLocalGroup({ titleTopic, siteProperty, domainDisplayName, preferredDomainGroup }) {
+  if (titleTopic && !WEAK_TITLE_GROUPS.has(titleTopic)) {
+    return titleTopic;
   }
 
-  if (siteGroup) {
-    return siteGroup;
+  if (preferredDomainGroup) {
+    return preferredDomainGroup;
   }
 
-  if (titleGroup) {
-    return titleGroup;
+  if (siteProperty) {
+    return siteProperty;
   }
 
-  return domainGroup || "其他";
+  if (titleTopic) {
+    return titleTopic;
+  }
+
+  return domainDisplayName || "其他";
 }
 
 function getTitleGroup(title, _url) {
@@ -1144,6 +1112,136 @@ function getTitleGroup(title, _url) {
   return "";
 }
 
+function getFunctionalTopic(tab) {
+  const titleGroup = getTitleGroup(tab.title || "", tab.url || "");
+  if (titleGroup && !WEAK_TITLE_GROUPS.has(titleGroup)) {
+    return titleGroup;
+  }
+
+  const candidates = [
+    ...extractFunctionalTopicCandidates(tab.title || ""),
+    extractGithubRepositoryTopic(tab.url || "")
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    const clean = cleanFunctionalTopicCandidate(candidate);
+    if (isUsefulFunctionalTopic(clean)) {
+      return formatFunctionalTopic(clean);
+    }
+  }
+
+  return "";
+}
+
+function extractFunctionalTopicCandidates(title) {
+  const cleanTitle = stripTitleBoilerplate(title);
+  const keyword = "(?:教程|下载|安装|配置|部署|搭建|运行|接入|实战|详解|使用|文档|指南|手册|官网|插件|扩展|入门|源码|release|releases|download|downloads|docs?|documentation|guide|tutorial|install|setup|deploy|deployment|manual|wiki)";
+  const token = "([A-Za-z0-9][A-Za-z0-9.+_-]{1,40}|[\\u4e00-\\u9fa5A-Za-z0-9][\\u4e00-\\u9fa5A-Za-z0-9.+_-]{1,24})";
+  const beforeKeyword = new RegExp(`${token}\\s*(?:的)?\\s*${keyword}`, "gi");
+  const afterKeyword = new RegExp(`${keyword}\\s*(?:[:：-])?\\s*${token}`, "gi");
+  const candidates = [];
+  const keywordIndex = cleanTitle.search(new RegExp(keyword, "i"));
+
+  if (keywordIndex > 0) {
+    const prefix = cleanTitle.slice(0, keywordIndex);
+    candidates.push(...getPrefixTopicCandidates(prefix));
+  }
+
+  for (const match of cleanTitle.matchAll(beforeKeyword)) {
+    candidates.push(match[1]);
+  }
+  for (const match of cleanTitle.matchAll(afterKeyword)) {
+    candidates.push(match[1]);
+  }
+
+  return candidates;
+}
+
+function getPrefixTopicCandidates(prefix) {
+  const clean = String(prefix || "")
+    .replace(/[()[\]{}"'`]/g, " ")
+    .replace(/[-_:：/|—]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!clean) {
+    return [];
+  }
+
+  const parts = clean.split(/\s+/).filter((part) => {
+    return !FUNCTIONAL_TOPIC_STOP_WORDS.has(part.toLowerCase());
+  });
+  if (!parts.length) {
+    return [];
+  }
+  return [parts.join(" "), parts[0]];
+}
+
+function extractGithubRepositoryTopic(url) {
+  try {
+    const parsed = new URL(url);
+    const hostname = parsed.hostname.toLowerCase().replace(/^www\./, "");
+    if (hostname !== "github.com") {
+      return "";
+    }
+    const [, owner, repo] = parsed.pathname.split("/");
+    if (!owner || !repo) {
+      return "";
+    }
+    return repo.replace(/\.git$/i, "");
+  } catch {
+    return "";
+  }
+}
+
+function stripTitleBoilerplate(title) {
+  return String(title || "")
+    .replace(/^github\s*[-:]\s*/i, "")
+    .replace(/^csdn\s*[-:]\s*/i, "")
+    .replace(new RegExp(`\\s*[-_|—–]\\s*${SOURCE_NAME_PATTERN}.*`, "i"), "")
+    .replace(new RegExp(`^${SOURCE_NAME_PATTERN}\\s*[-_:：|—–]\\s*`, "i"), "")
+    .trim();
+}
+
+function cleanFunctionalTopicCandidate(candidate) {
+  let clean = String(candidate || "")
+    .replace(/[()[\]{}"'`]/g, " ")
+    .replace(/[-_]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const parts = clean.split(/\s+/).filter((part) => {
+    return !FUNCTIONAL_TOPIC_STOP_WORDS.has(part.toLowerCase());
+  });
+  clean = parts.join(" ").trim();
+  return clean;
+}
+
+function isUsefulFunctionalTopic(topic) {
+  const clean = String(topic || "").trim();
+  if (!clean) {
+    return false;
+  }
+  const key = normalizeTopicKey(clean);
+  if (!key || FUNCTIONAL_TOPIC_STOP_WORDS.has(key)) {
+    return false;
+  }
+  return /[a-z0-9\u4e00-\u9fa5]/i.test(clean) && key.length >= 2;
+}
+
+function normalizeTopicKey(topic) {
+  return String(topic || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fa5]+/g, "");
+}
+
+function formatFunctionalTopic(topic) {
+  const clean = String(topic || "").trim();
+  if (/^[a-z0-9 .+_-]+$/i.test(clean)) {
+    return formatDomainLabel(clean);
+  }
+  return clean;
+}
+
 function getSitePropertyGroup(url) {
   let hostname = "";
   try {
@@ -1156,6 +1254,26 @@ function getSitePropertyGroup(url) {
     if (rule.domains.some((domain) => hostname === domain || hostname.endsWith(`.${domain}`))) {
       return rule.group;
     }
+  }
+
+  return "";
+}
+
+function getPreferredDomainGroup(url) {
+  let hostname = "";
+  try {
+    hostname = new URL(url).hostname.toLowerCase().replace(/^www\./, "");
+  } catch {
+    return "";
+  }
+
+  if (PRODUCT_DOMAIN_GROUPS.has(hostname)) {
+    return getDomainName(url);
+  }
+
+  const domain = getDomainGroup(url);
+  if (PRODUCT_DOMAIN_GROUPS.has(domain)) {
+    return getDomainName(url);
   }
 
   return "";
