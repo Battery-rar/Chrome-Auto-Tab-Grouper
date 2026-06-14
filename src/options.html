@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Auto Tab Grouper 设置</title>
+    <link rel="stylesheet" href="options.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="header">
+        <div>
+          <h1>Auto Tab Grouper</h1>
+          <p>点击按钮后，按标题、网站属性、域名或 AI 语义分类整理当前窗口。</p>
+        </div>
+      </header>
+
+      <section class="panel">
+        <h2>分类模式</h2>
+        <div class="segmented">
+          <label>
+            <input type="radio" name="mode" value="local">
+            <span>本地规则</span>
+          </label>
+          <label>
+            <input type="radio" name="mode" value="cloud">
+            <span>云端 AI</span>
+          </label>
+        </div>
+        <label class="checkbox-row">
+          <input id="includeSingleTabGroups" type="checkbox">
+          <span>单个标签页也创建分组</span>
+        </label>
+      </section>
+
+      <section class="panel">
+        <h2>云端 AI</h2>
+        <div class="grid">
+          <label>
+            <span>API 链接</span>
+            <input id="cloudApiUrl" type="url" placeholder="https://api.openai.com/v1/chat/completions">
+          </label>
+          <label>
+            <span>API Key</span>
+            <input id="cloudApiKey" type="password" placeholder="sk-...">
+          </label>
+          <label>
+            <span>模型名称</span>
+            <input id="cloudModel" type="text" placeholder="gpt-4.1-mini">
+          </label>
+          <label>
+            <span>云端分类缓存（小时）</span>
+            <input id="cacheTtlHours" type="number" min="1" max="720" step="1">
+          </label>
+        </div>
+        <p class="hint">云端模式会优先按标题里的主题分类，再看网站属性，最后才用域名兜底。它会把标签页标题、URL 和域名发送到你配置的 API 链接。</p>
+      </section>
+
+      <section class="actions">
+        <button id="save" class="primary" type="button">保存设置</button>
+        <button id="testCloud" type="button">测试云端分类</button>
+        <button id="regroupNow" type="button">立即分组当前窗口</button>
+      </section>
+
+      <p id="status" class="status" role="status"></p>
+    </main>
+
+    <script src="options.js"></script>
+  </body>
+</html>
