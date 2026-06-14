@@ -66,6 +66,10 @@ h2 {
   white-space: nowrap;
 }
 
+.cloud-toggle {
+  margin-top: 14px;
+}
+
 .segmented {
   display: inline-grid;
   grid-template-columns: repeat(2, minmax(110px, 1fr));
@@ -140,6 +144,10 @@ input:focus {
 .hint {
   margin-top: 12px;
   font-size: 13px;
+}
+
+.thinking-risk {
+  margin-top: 6px;
 }
 
 .actions {

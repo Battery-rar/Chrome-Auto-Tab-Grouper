@@ -4,6 +4,7 @@ const fields = {
   cloudApiKey: document.querySelector("#cloudApiKey"),
   cloudModel: document.querySelector("#cloudModel"),
   cacheTtlHours: document.querySelector("#cacheTtlHours"),
+  enableThinking: document.querySelector("#enableThinking"),
   status: document.querySelector("#status"),
   logTerminal: document.querySelector("#logTerminal")
 };
@@ -31,6 +32,7 @@ async function loadSettings() {
   fields.cloudApiKey.value = settings.cloudApiKey || "";
   fields.cloudModel.value = settings.cloudModel || "";
   fields.cacheTtlHours.value = settings.cacheTtlHours || 24;
+  fields.enableThinking.checked = settings.disableThinking === false;
 
   const mode = settings.mode === "cloud" ? "cloud" : "local";
   document.querySelector(`input[name="mode"][value="${mode}"]`).checked = true;
@@ -48,7 +50,8 @@ async function saveSettings() {
     cloudApiUrl: fields.cloudApiUrl.value.trim(),
     cloudApiKey: fields.cloudApiKey.value.trim(),
     cloudModel: fields.cloudModel.value.trim(),
-    cacheTtlHours: Number(fields.cacheTtlHours.value || 24)
+    cacheTtlHours: Number(fields.cacheTtlHours.value || 24),
+    disableThinking: !fields.enableThinking.checked
   };
 
   const response = await sendMessage({ type: "save-settings", settings });
@@ -86,6 +89,7 @@ async function regroupNow() {
 }
 
 async function refreshLogs() {
+  const shouldStickToBottom = isLogTerminalAtBottom();
   const response = await sendMessage({ type: "get-logs" });
   if (!response.ok) {
     fields.logTerminal.textContent = response.error || "读取日志失败。";
@@ -94,7 +98,9 @@ async function refreshLogs() {
 
   const logs = response.logs || [];
   fields.logTerminal.textContent = logs.length ? logs.map(formatLogEntry).join("\n\n") : "暂无日志。";
-  fields.logTerminal.scrollTop = fields.logTerminal.scrollHeight;
+  if (shouldStickToBottom) {
+    fields.logTerminal.scrollTop = fields.logTerminal.scrollHeight;
+  }
 }
 
 async function clearLogs() {
@@ -123,6 +129,11 @@ function setStatus(message, ok) {
   fields.status.textContent = message;
   fields.status.classList.toggle("ok", Boolean(ok));
   fields.status.classList.toggle("error", ok === false);
+}
+
+function isLogTerminalAtBottom() {
+  const terminal = fields.logTerminal;
+  return terminal.scrollHeight - terminal.scrollTop - terminal.clientHeight < 24;
 }
 
 function formatLogEntry(entry) {

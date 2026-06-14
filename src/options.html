@@ -53,6 +53,11 @@
             <input id="cacheTtlHours" type="number" min="1" max="720" step="1">
           </label>
         </div>
+        <label class="checkbox-row cloud-toggle">
+          <input id="enableThinking" type="checkbox">
+          <span>开启思考模式</span>
+        </label>
+        <p class="hint thinking-risk">仅 DeepSeek 等推理模型会受影响。开启后可能更慢，并增加超时、空 content 或 JSON 不稳定的风险。</p>
         <p class="hint">云端模式会先本地识别明确主题，只把不确定的标签交给 AI。发送内容包括标题、域名、站点名和截短后的 URL 线索。</p>
       </section>
 
