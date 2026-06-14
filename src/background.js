@@ -45,6 +45,9 @@ const DOMAIN_DISPLAY_NAMES = new Map([
   ["npmjs.com", "npm"],
   ["pypi.org", "PyPI"],
   ["crates.io", "crates.io"],
+  ["csdn.net", "CSDN"],
+  ["blog.csdn.net", "CSDN"],
+  ["download.csdn.net", "CSDN"],
   ["google.com", "Google"],
   ["youtube.com", "YouTube"],
   ["youtu.be", "YouTube"],
@@ -306,7 +309,7 @@ async function regroupWindow(windowId) {
   }
 
   const classification = await classifyTabs(tabs, settings);
-  const classified = classification.items;
+  const classified = stabilizeSingletonsByDomain(classification.items, settings);
   const groups = new Map();
 
   for (const item of classified) {
@@ -335,6 +338,7 @@ async function regroupWindow(windowId) {
 
   await ungroupTabIds(staleGroupedTabIds);
 
+  const createdGroups = [];
   for (const [groupName, tabIds] of eligibleGroups) {
     const groupId = await groupTabIds(tabIds);
     await updateGroup(groupId, {
@@ -342,10 +346,13 @@ async function regroupWindow(windowId) {
       color: colorForIndex(groupCount),
       collapsed: false
     });
+    createdGroups.push({ groupId, groupName, tabIds });
     groupCount += 1;
     groupedTabs += tabIds.length;
   }
+  await ensureGroupMembership(windowId, createdGroups);
   await moveTabIds(groupedTabIdsInOrder, groupedStartIndex);
+  await ensureGroupMembership(windowId, createdGroups);
 
   const skippedTabs = tabs.length - groupedTabs;
   let resultMessage = `已整理 ${groupedTabs} 个标签，生成 ${groupCount} 个分组。`;
@@ -395,6 +402,61 @@ async function classifyTabs(tabs, settings) {
     })),
     warning: ""
   };
+}
+
+function stabilizeSingletonsByDomain(items, settings) {
+  if (settings.includeSingleTabGroups) {
+    return items;
+  }
+
+  const groupCounts = countBy(items, (item) => item.group);
+  const domainBuckets = new Map();
+
+  for (const item of items) {
+    const domainKey = getDomainGroup(item.tab?.url || "");
+    const domainName = getDomainName(item.tab?.url || "");
+    if (!domainKey || domainKey === "其他" || !domainName || domainName === "其他") {
+      continue;
+    }
+    if (!domainBuckets.has(domainKey)) {
+      domainBuckets.set(domainKey, { group: domainName, items: [] });
+    }
+    domainBuckets.get(domainKey).items.push(item);
+  }
+
+  const fallbackByTabId = new Map();
+  for (const bucket of domainBuckets.values()) {
+    if (bucket.items.length < 2) {
+      continue;
+    }
+    for (const item of bucket.items) {
+      const isSingleton = Number(groupCounts.get(item.group) || 0) === 1;
+      if (isSingleton && item.group !== bucket.group) {
+        fallbackByTabId.set(item.tab.id, bucket.group);
+      }
+    }
+  }
+
+  if (!fallbackByTabId.size) {
+    return items;
+  }
+
+  return items.map((item) => {
+    const fallbackGroup = fallbackByTabId.get(item.tab.id);
+    return fallbackGroup ? { ...item, group: fallbackGroup } : item;
+  });
+}
+
+function countBy(items, getKey) {
+  const counts = new Map();
+  for (const item of items) {
+    const key = getKey(item);
+    if (!key) {
+      continue;
+    }
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  return counts;
 }
 
 async function classifyTabsWithCache(tabs, settings) {
@@ -1367,6 +1429,45 @@ function groupTabIds(tabIds) {
       }
     });
   });
+}
+
+function addTabIdsToGroup(groupId, tabIds) {
+  return new Promise((resolve, reject) => {
+    if (!tabIds.length) {
+      resolve(groupId);
+      return;
+    }
+    chrome.tabs.group({ groupId, tabIds }, (updatedGroupId) => {
+      const error = chrome.runtime.lastError;
+      if (error) {
+        reject(new Error(error.message));
+      } else {
+        resolve(updatedGroupId);
+      }
+    });
+  });
+}
+
+async function ensureGroupMembership(windowId, groupSpecs) {
+  if (!groupSpecs.length) {
+    return;
+  }
+
+  const currentTabs = await queryTabs({ windowId });
+  const groupIdByTabId = new Map(currentTabs.map((tab) => [tab.id, tab.groupId]));
+
+  for (const spec of groupSpecs) {
+    const missingTabIds = spec.tabIds.filter((tabId) => groupIdByTabId.get(tabId) !== spec.groupId);
+    if (!missingTabIds.length) {
+      continue;
+    }
+    await appendLog("warn", "分组状态未完全落地，已补拉标签", {
+      group: spec.groupName,
+      groupId: spec.groupId,
+      tabIds: missingTabIds
+    });
+    await addTabIdsToGroup(spec.groupId, missingTabIds);
+  }
 }
 
 function moveTabIds(tabIds, index) {
