@@ -1,5 +1,6 @@
 const SETTINGS_KEY = "autoTabGrouperSettings";
 const CACHE_KEY = "autoTabGrouperCloudCache";
+const CLOUD_CACHE_VERSION = "2026-06-15-search-forum-ai-v1";
 const LAST_STATUS_KEY = "autoTabGrouperLastStatus";
 const LOG_KEY = "autoTabGrouperLogs";
 
@@ -15,6 +16,7 @@ const DEFAULT_SETTINGS = {
 
 const CLOUD_TIMEOUT_MS = 60000;
 const CLOUD_MAX_OUTPUT_TOKENS = 4096;
+const CLOUD_FETCH_RETRY_DELAYS_MS = [700, 1800];
 const MAX_LOG_ENTRIES = 120;
 const MAX_LOG_DETAIL_LENGTH = 5000;
 loadRuleDefinitions();
@@ -26,6 +28,7 @@ const {
   GROUP_COLORS,
   FUNCTIONAL_SITE_GROUPS,
   CLOUD_FINE_GRAINED_GROUPS,
+  SEARCH_ENGINE_DOMAINS,
   DOMAIN_DISPLAY_NAMES,
   PRODUCT_DOMAIN_GROUPS,
   TITLE_TOPIC_RULES,
@@ -405,7 +408,7 @@ async function classifyTabsWithCache(tabs, settings) {
   const cacheTtl = Math.max(1, Number(settings.cacheTtlHours || DEFAULT_SETTINGS.cacheTtlHours)) * 60 * 60 * 1000;
   const cache = (await getStorage(CACHE_KEY)) || {};
   const { items, localFallbackByTabId } = buildClassifiableItems(tabs);
-  const batchKey = getCloudBatchCacheKey(items);
+  const batchKey = getCloudBatchCacheKey(items, settings);
   const cached = cache[batchKey];
 
   if (cached && now - cached.at < cacheTtl && cached.groups) {
@@ -464,12 +467,15 @@ async function classifyCandidateGroupsWithCloud(candidates, settings, isTest = f
     "不要输出推理过程，不要逐项解释，不要先分析；直接输出最终 JSON。",
     "你会收到本地预处理后的候选组摘要和候选内标签线索。你的任务是像人整理浏览器一样合并候选组，并给最终分组智能命名。",
     "不要机械照抄 suggestedName。suggestedName 只是兜底；你必须阅读 sampleTitles、tabDetails、urlHints、signals 和 intelligenceHints，判断这些标签真正是在做什么。",
-    "每个候选组有 confidence：high 表示本地已有明确功能主题、明确产品/技术主题或官方产品域名信号，通常应保留其主题；但如果 high 只是 GitHub、YouTube、哔哩哔哩、知乎、CSDN 这类来源平台名，仍然要继续看标题和 URL，优先按项目/教程对象/任务合并。medium/low 表示只是弱标题、网站属性或普通域名兜底，必须进一步阅读标题、URL、域名和信号来判断是否能合并成更具体的功能组。",
+    "每个候选组有 confidence：high 表示本地已有明确功能主题、明确产品/技术主题或官方产品域名信号，通常应保留其主题；但如果 high 只是 GitHub、YouTube、哔哩哔哩、知乎、Reddit、Quora、CSDN、Google、Bing、百度这类来源平台名，仍然要继续看标题、URL 和 searchQuery，优先按项目/教程对象/任务合并。medium/low 表示只是弱标题、网站属性或普通域名兜底，必须进一步阅读标题、URL、域名和信号来判断是否能合并成更具体的功能组。",
     "必须按以下多层机制判断：",
     "1. 名字/标题层：优先看标题里的主题、产品、技术栈、教程对象。不同网站、不同域名但标题主题相同的候选组必须合并到同一组。例如 YouTube、知乎、博客里的 Rime、小狼毫、鼠须管、雾凇拼音教程都归为 Rime 输入法，而不是视频、社交或各自域名。",
-    "2. 功能上下文层：教程、下载、安装、配置、部署、文档、release、GitHub 项目页如果围绕同一个对象，应合并为该对象或对象+用途，例如 Python、Foo 工具、Rime 输入法、Ollama。本地大模型教程、Ollama 下载页、Open WebUI/Ollama 相关文档如果明显围绕 Ollama，应合并到 Ollama 或 Ollama 工具链。GitHub 仓库、官网、文档、下载页、教程文章如果指向同一项目，也应该归到项目名。",
+    "2. 功能上下文层：教程、下载、安装、配置、部署、文档、release、GitHub 项目页如果围绕同一个对象，应合并为该对象或对象+用途，例如 Python、Foo 工具、Rime 输入法、Ollama。本地大模型教程、Ollama 下载页、Open WebUI/Ollama 相关文档如果明显围绕 Ollama，应合并到 Ollama 或 Ollama 工具链。GitHub 仓库、官网、文档、下载页、教程文章、论坛讨论如果指向同一项目，也应该归到项目名。",
     "3. 产品/站点域名层：preferredDomainGroups 表示官网、文档站、下载页或强站点名对应的产品/站点，例如 Ollama、Open WebUI、Dify、GitHub、GitLab、Gitee。它比泛化的网站属性 AI、文档、办公、代码更具体。",
-    "4. 网站属性层：如果标题没有明确共同主题，再看网站属性，例如视频、代码、文档、邮箱、聊天、搜索、购物、社交、新闻、金融、设计、办公。邮箱、聊天是强功能属性，可以跨站合并，例如 QQ 邮箱和 Outlook 归为邮箱，WhatsApp、Telegram、Discord、企业微信归为聊天，不要被 qq.com、google.com、microsoft.com 这类大平台主域抢走。GitHub、GitLab、Gitee、Bitbucket 这类代码托管站点不要泛化成代码；只有 Stack Overflow、npm、PyPI、crates.io、pkg.go.dev 这类代码问答/包资源站点才适合用代码。",
+    "4. 网站属性层：如果标题没有明确共同主题，再看网站属性，例如视频、代码、文档、邮箱、聊天、搜索、论坛、AI、购物、社交、新闻、金融、设计、办公。邮箱、聊天是强功能属性，可以跨站合并，例如 QQ 邮箱和 Outlook 归为邮箱，WhatsApp、Telegram、Discord、企业微信归为聊天，不要被 qq.com、google.com、microsoft.com 这类大平台主域抢走。GitHub、GitLab、Gitee、Bitbucket 这类代码托管站点不要泛化成代码；只有 Stack Overflow、npm、PyPI、crates.io、pkg.go.dev 这类代码问答/包资源站点才适合用代码。",
+    "搜索引擎特殊规则：Google、Bing、百度、DuckDuckGo、Kagi、Brave Search、搜狗、360 搜索等搜索页如果有 searchQuery，必须优先根据 searchQuery 归到相关主题。例如搜索 Ollama 下载应归到 Ollama；搜索 Rime 配置应归到 Rime 输入法。只有搜索词无法与任何其他候选或主题建立联系时，才归为搜索或具体搜索引擎。",
+    "论坛/问答特殊规则：Reddit、Quora、知乎、V2EX、贴吧、豆瓣、Hacker News 等如果讨论的是某个产品、技术或任务，应归到该主题；只有看不出具体主题或多个论坛页都只是泛讨论时，才归为论坛或站点名。",
+    "AI 产品规则：国内外 AI 工具和模型站点应尽量按产品名命名，例如 ChatGPT/OpenAI、Claude、DeepSeek、Kimi、通义千问、豆包、Gemini、Grok、Perplexity、Microsoft Copilot、腾讯元宝、腾讯混元、Mistral、Groq、Hugging Face、硅基流动、魔搭社区等。",
     "5. 站点名层：如果仍不能判断，才使用站点名，例如 GitHub、Google Docs、哔哩哔哩、CSDN。",
     "直觉规则：如果多个标签看起来是同一件事的不同入口、教程、下载、文档、源码、讨论或视频，合成一个具体主题组；如果只是同一平台上毫不相关的内容，才按平台名分开。",
     "智能命名要求：组名要尽量具体、稳定、可复用；有具体主题时用主题名或主题+类别，例如 Rime 输入法、React 文档、OpenAI API，不要用笼统的“教程”“文章”；有具体产品时用产品名，不要用网站类型。",
@@ -499,6 +505,7 @@ async function classifyCandidateGroupsWithCloud(candidates, settings, isTest = f
       signals: {
         functionalTopics: candidate.functionalTopics,
         titleTopics: candidate.titleTopics,
+        searchQueryTopics: candidate.searchQueryTopics,
         preferredDomainGroups: candidate.preferredDomainGroups,
         siteProperties: candidate.siteProperties,
         domainDisplayNames: candidate.domainDisplayNames
@@ -537,14 +544,18 @@ async function classifyCandidateGroupsWithCloud(candidates, settings, isTest = f
       lastError = error;
       const jsonModeError = attempt.useJsonMode && isLikelyJsonModeError(error);
       const thinkingError = attempt.disableThinking && isLikelyThinkingParamError(error);
-      if (!jsonModeError && !thinkingError) {
+      const transientFetchError = isLikelyTransientFetchError(error);
+      if (!jsonModeError && !thinkingError && !transientFetchError) {
         throw error;
       }
-      skipJsonMode = skipJsonMode || jsonModeError;
-      skipThinking = skipThinking || thinkingError;
-      await appendLog("warn", "云端请求参数不兼容，准备重试", {
+      skipJsonMode = skipJsonMode || jsonModeError || (transientFetchError && attempt.useJsonMode);
+      skipThinking = skipThinking || thinkingError || (transientFetchError && attempt.disableThinking);
+      await appendLog("warn", transientFetchError ? "云端网络层请求失败，准备换参数重试" : "云端请求参数不兼容，准备重试", {
         jsonMode: attempt.useJsonMode,
         thinkingDisabled: attempt.disableThinking,
+        transientFetchError,
+        nextSkipJsonMode: skipJsonMode,
+        nextSkipThinking: skipThinking,
         reason: normalizeError(error)
       });
     }
@@ -631,23 +642,43 @@ function shouldSendThinkingDisable(settings) {
 }
 
 async function postCloudJson(apiUrl, headers, body) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), CLOUD_TIMEOUT_MS);
   let response;
-  try {
-    response = await fetch(apiUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-      signal: controller.signal
-    });
-  } catch (error) {
-    if (error?.name === "AbortError") {
-      throw new Error("云端分类超过 1 分钟，已停止等待。");
+  const requestText = JSON.stringify(body);
+  const maxAttempts = 1 + CLOUD_FETCH_RETRY_DELAYS_MS.length;
+  for (let attemptIndex = 0; attemptIndex < maxAttempts; attemptIndex += 1) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), CLOUD_TIMEOUT_MS);
+    try {
+      response = await fetch(apiUrl, {
+        method: "POST",
+        headers,
+        body: requestText,
+        signal: controller.signal
+      });
+      break;
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        throw new Error("云端分类超过 1 分钟，已停止等待。");
+      }
+      const canRetry = isRawTransientFetchError(error) && attemptIndex < maxAttempts - 1;
+      if (!canRetry) {
+        const requestError = new Error(`请求失败: ${normalizeError(error)}`);
+        requestError.causeName = error?.name || "";
+        requestError.requestChars = requestText.length;
+        requestError.fetchAttempts = attemptIndex + 1;
+        throw requestError;
+      }
+      await appendLog("warn", "云端 fetch 失败，短暂等待后重试", {
+        attempt: attemptIndex + 1,
+        maxAttempts,
+        requestChars: requestText.length,
+        errorName: error?.name || "",
+        errorMessage: normalizeError(error)
+      });
+      await delay(CLOUD_FETCH_RETRY_DELAYS_MS[attemptIndex]);
+    } finally {
+      clearTimeout(timeoutId);
     }
-    throw new Error(`请求失败: ${normalizeError(error)}`);
-  } finally {
-    clearTimeout(timeoutId);
   }
 
   const responseText = typeof response.text === "function"
@@ -680,6 +711,16 @@ function isLikelyJsonModeError(error) {
 function isLikelyThinkingParamError(error) {
   const message = normalizeError(error).toLowerCase();
   return /thinking|reasoning|unsupported.*parameter|unknown.*parameter|unrecognized.*parameter|invalid.*parameter|invalid.*thinking/.test(message);
+}
+
+function isLikelyTransientFetchError(error) {
+  const message = normalizeError(error).toLowerCase();
+  return isRawTransientFetchError(error) || /请求失败:.*(?:failed to fetch|networkerror|load failed|network request failed)/i.test(message);
+}
+
+function isRawTransientFetchError(error) {
+  const message = normalizeError(error).toLowerCase();
+  return error?.name === "TypeError" && /failed to fetch|networkerror|load failed|network request failed/.test(message);
 }
 
 function assertCloudCompletionUsable(data) {
@@ -963,11 +1004,13 @@ function buildClassifiableItems(tabs) {
 
 function toClassifiableTab(tab, functionalTopic = "") {
   const titleTopic = getTitleGroup(tab.title || "", tab.url || "");
+  const searchQuery = extractSearchQuery(tab.url || "");
+  const searchQueryTopic = getSearchQueryTopic(tab.url || "");
   const siteProperty = getSitePropertyGroup(tab.url || "");
   const domainDisplayName = getDomainName(tab.url);
   const preferredDomainGroup = getPreferredDomainGroup(tab.url || "");
   const localFallback = functionalTopic || chooseLocalGroup({
-    titleTopic,
+    titleTopic: titleTopic || searchQueryTopic,
     siteProperty,
     domainDisplayName,
     preferredDomainGroup
@@ -979,11 +1022,13 @@ function toClassifiableTab(tab, functionalTopic = "") {
     domain: getDomainGroup(tab.url),
     functionalTopic,
     titleTopic,
+    searchQueryTopic,
     siteProperty,
     domainDisplayName,
     preferredDomainGroup,
+    searchQuery,
     localFallback,
-    confidence: getLocalSignalConfidence({ functionalTopic, titleTopic, siteProperty, domainDisplayName, preferredDomainGroup })
+    confidence: getLocalSignalConfidence({ functionalTopic, titleTopic: titleTopic || searchQueryTopic, siteProperty, domainDisplayName, preferredDomainGroup })
   };
 }
 
@@ -1028,6 +1073,7 @@ function createCloudCandidate(index, item) {
     domains: new Set(),
     functionalTopics: new Set(),
     titleTopics: new Set(),
+    searchQueryTopics: new Set(),
     preferredDomainGroups: new Set(),
     siteProperties: new Set(),
     domainDisplayNames: new Set(),
@@ -1046,6 +1092,7 @@ function addItemToCloudCandidate(candidate, item) {
   addNonEmpty(candidate.domains, item.domain);
   addNonEmpty(candidate.functionalTopics, item.functionalTopic);
   addNonEmpty(candidate.titleTopics, item.titleTopic);
+  addNonEmpty(candidate.searchQueryTopics, item.searchQueryTopic);
   addNonEmpty(candidate.preferredDomainGroups, item.preferredDomainGroup);
   addNonEmpty(candidate.siteProperties, item.siteProperty);
   addNonEmpty(candidate.domainDisplayNames, item.domainDisplayName);
@@ -1060,6 +1107,7 @@ function finalizeCloudCandidate(candidate) {
     domains: setToArray(candidate.domains, 4),
     functionalTopics: setToArray(candidate.functionalTopics, 4),
     titleTopics: setToArray(candidate.titleTopics, 4),
+    searchQueryTopics: setToArray(candidate.searchQueryTopics, 4),
     preferredDomainGroups: setToArray(candidate.preferredDomainGroups, 4),
     siteProperties: setToArray(candidate.siteProperties, 4),
     domainDisplayNames: setToArray(candidate.domainDisplayNames, 4),
@@ -1093,6 +1141,7 @@ function summarizeCandidates(candidates) {
     confidence: candidate.confidence,
     functionalTopics: candidate.functionalTopics,
     titleTopics: candidate.titleTopics,
+    searchQueryTopics: candidate.searchQueryTopics,
     preferredDomainGroups: candidate.preferredDomainGroups,
     siteProperties: candidate.siteProperties,
     domainDisplayNames: candidate.domainDisplayNames,
@@ -1113,6 +1162,7 @@ function safeEndpoint(url) {
 function getCandidateKey(item) {
   const strongGroup = item.functionalTopic
     || (item.titleTopic && !WEAK_TITLE_GROUPS.has(item.titleTopic) ? item.titleTopic : "")
+    || (item.searchQueryTopic && !WEAK_TITLE_GROUPS.has(item.searchQueryTopic) ? item.searchQueryTopic : "")
     || (isFunctionalSiteGroup(item.siteProperty) ? item.siteProperty : "")
     || (isCloudFineGrainedGroup(item.preferredDomainGroup) ? "" : item.preferredDomainGroup);
   if (strongGroup) {
@@ -1135,12 +1185,14 @@ function isCloudFineGrainedGroup(group) {
 function createCloudTabDetail(item) {
   return {
     tabId: item.id,
-    title: truncateString(item.title || "", 120),
-    url: compactUrl(item.url || ""),
-    domain: item.domain,
-    signals: compactObject({
+      title: truncateString(item.title || "", 120),
+      url: compactUrl(item.url || ""),
+      domain: item.domain,
+      searchQuery: item.searchQuery || "",
+      signals: compactObject({
       functionalTopic: item.functionalTopic,
       titleTopic: item.titleTopic,
+      searchQueryTopic: item.searchQueryTopic,
       preferredDomainGroup: item.preferredDomainGroup,
       siteProperty: item.siteProperty,
       domainDisplayName: item.domainDisplayName
@@ -1150,6 +1202,10 @@ function createCloudTabDetail(item) {
 
 function getCloudIntelligenceHints(item) {
   const hints = [];
+  if (item.searchQuery) {
+    hints.push(`searchQuery:${item.searchQuery}`);
+  }
+
   const githubRepository = extractGithubRepositoryParts(item.url || "");
   if (githubRepository) {
     hints.push(`githubRepo:${githubRepository.owner}/${githubRepository.repo}`);
@@ -1230,12 +1286,13 @@ function isGroupableTab(tab) {
 
 function getLocalGroup(tab) {
   const titleGroup = getTitleGroup(tab.title || "", tab.url || "");
+  const searchQueryTopic = getSearchQueryTopic(tab.url || "");
   const siteGroup = getSitePropertyGroup(tab.url || "");
   const domainGroup = getDomainName(tab.url);
   const preferredDomainGroup = getPreferredDomainGroup(tab.url || "");
 
   return chooseLocalGroup({
-    titleTopic: titleGroup,
+    titleTopic: titleGroup || searchQueryTopic,
     siteProperty: siteGroup,
     domainDisplayName: domainGroup,
     preferredDomainGroup
@@ -1295,14 +1352,46 @@ function getFunctionalTopic(tab) {
     }
   }
 
+  const searchQuery = extractSearchQuery(tab.url || "");
+  if (searchQuery) {
+    const searchQueryTopic = getSearchQueryTopic(tab.url || "");
+    if (searchQueryTopic) {
+      return searchQueryTopic;
+    }
+  }
+
   const titleGroup = getTitleGroup(tab.title || "", tab.url || "");
   if (titleGroup && !WEAK_TITLE_GROUPS.has(titleGroup)) {
     return titleGroup;
   }
 
-  const candidates = extractFunctionalTopicCandidates(tab.title || "").filter(Boolean);
+  const candidates = [
+    ...extractFunctionalTopicCandidates(searchQuery || ""),
+    ...extractFunctionalTopicCandidates(tab.title || "")
+  ].filter(Boolean);
 
   for (const candidate of candidates) {
+    const clean = cleanFunctionalTopicCandidate(candidate);
+    if (isUsefulFunctionalTopic(clean)) {
+      return formatFunctionalTopic(clean);
+    }
+  }
+
+  return "";
+}
+
+function getSearchQueryTopic(url) {
+  const searchQuery = extractSearchQuery(url);
+  if (!searchQuery) {
+    return "";
+  }
+
+  const titleGroup = getTitleGroup(searchQuery, "");
+  if (titleGroup && !WEAK_TITLE_GROUPS.has(titleGroup)) {
+    return titleGroup;
+  }
+
+  for (const candidate of extractFunctionalTopicCandidates(searchQuery)) {
     const clean = cleanFunctionalTopicCandidate(candidate);
     if (isUsefulFunctionalTopic(clean)) {
       return formatFunctionalTopic(clean);
@@ -1456,6 +1545,40 @@ function getSitePropertyGroup(url) {
   return "";
 }
 
+function extractSearchQuery(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return "";
+  }
+
+  const hostname = parsed.hostname.toLowerCase().replace(/^www\./, "");
+  const domain = getDomainGroup(url);
+  if (!SEARCH_ENGINE_DOMAINS.has(hostname) && !SEARCH_ENGINE_DOMAINS.has(domain)) {
+    return "";
+  }
+
+  const queryKeys = ["q", "query", "wd", "word", "text", "p", "search", "keyword", "keywords", "kw", "qword"];
+  for (const key of queryKeys) {
+    const value = parsed.searchParams.get(key);
+    const clean = cleanSearchQuery(value);
+    if (clean) {
+      return clean;
+    }
+  }
+
+  return "";
+}
+
+function cleanSearchQuery(value) {
+  return String(value || "")
+    .replace(/\+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+}
+
 function getPreferredDomainGroup(url) {
   let hostname = "";
   try {
@@ -1587,12 +1710,20 @@ function getTabSignature(tab) {
   return `${tab.url || ""}\n${tab.title || ""}`;
 }
 
-function getCloudBatchCacheKey(items) {
+function getCloudBatchCacheKey(items, settings = {}) {
   const signature = items
     .map((item) => getTabSignature(item))
     .sort()
     .join("\n---\n");
-  return `batch:${hashString(signature)}`;
+  const endpoint = safeEndpoint(settings.cloudApiUrl || "");
+  const model = String(settings.cloudModel || "").trim();
+  const modeSignature = [
+    CLOUD_CACHE_VERSION,
+    endpoint,
+    model,
+    shouldSendThinkingDisable(settings) ? "thinking-disabled" : "thinking-enabled"
+  ].join("\n");
+  return `batch:${hashString(`${modeSignature}\n===\n${signature}`)}`;
 }
 
 function hashString(text) {
@@ -1857,4 +1988,10 @@ function updateGroup(groupId, updateProperties) {
 
 function normalizeError(error) {
   return error?.message || String(error);
+}
+
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }

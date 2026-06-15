@@ -12,12 +12,12 @@ const fields = {
 document.querySelector("#save").addEventListener("click", saveSettings);
 document.querySelector("#testCloud").addEventListener("click", testCloud);
 document.querySelector("#regroupNow").addEventListener("click", regroupNow);
-document.querySelector("#refreshLogs").addEventListener("click", refreshLogs);
+document.querySelector("#refreshLogs").addEventListener("click", () => refreshLogs({ force: true }));
 document.querySelector("#clearLogs").addEventListener("click", clearLogs);
 
 loadSettings();
-refreshLogs();
-setInterval(refreshLogs, 3000);
+refreshLogs({ force: true });
+setInterval(() => refreshLogs(), 3000);
 
 async function loadSettings() {
   const response = await sendMessage({ type: "get-settings" });
@@ -72,7 +72,7 @@ async function testCloud() {
   } else {
     setStatus(response.error || "云端分类测试失败。", false);
   }
-  await refreshLogs();
+  await refreshLogs({ force: true });
 }
 
 async function regroupNow() {
@@ -85,19 +85,22 @@ async function regroupNow() {
   } else {
     setStatus(response.error || "立即分组失败。", false);
   }
-  await refreshLogs();
+  await refreshLogs({ force: true });
 }
 
-async function refreshLogs() {
+async function refreshLogs({ force = false } = {}) {
+  if (!force && isLogTerminalSelectionActive()) {
+    return;
+  }
   const shouldStickToBottom = isLogTerminalAtBottom();
   const response = await sendMessage({ type: "get-logs" });
   if (!response.ok) {
-    fields.logTerminal.textContent = response.error || "读取日志失败。";
+    setLogTerminalText(response.error || "读取日志失败。");
     return;
   }
 
   const logs = response.logs || [];
-  fields.logTerminal.textContent = logs.length ? logs.map(formatLogEntry).join("\n\n") : "暂无日志。";
+  setLogTerminalText(logs.length ? logs.map(formatLogEntry).join("\n\n") : "暂无日志。");
   if (shouldStickToBottom) {
     fields.logTerminal.scrollTop = fields.logTerminal.scrollHeight;
   }
@@ -106,7 +109,7 @@ async function refreshLogs() {
 async function clearLogs() {
   const response = await sendMessage({ type: "clear-logs" });
   if (response.ok) {
-    await refreshLogs();
+    await refreshLogs({ force: true });
   } else {
     setStatus(response.error || "清空日志失败。", false);
   }
@@ -134,6 +137,15 @@ function setStatus(message, ok) {
 function isLogTerminalAtBottom() {
   const terminal = fields.logTerminal;
   return terminal.scrollHeight - terminal.scrollTop - terminal.clientHeight < 24;
+}
+
+function isLogTerminalSelectionActive() {
+  const terminal = fields.logTerminal;
+  return document.activeElement === terminal && terminal.selectionStart !== terminal.selectionEnd;
+}
+
+function setLogTerminalText(text) {
+  fields.logTerminal.value = text;
 }
 
 function formatLogEntry(entry) {

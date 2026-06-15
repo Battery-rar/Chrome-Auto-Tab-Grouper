@@ -225,16 +225,25 @@ button.primary:hover {
 }
 
 .terminal {
+  display: block;
+  width: 100%;
   min-height: 180px;
   max-height: 360px;
   margin: 0;
   padding: 14px 16px;
+  border: 0;
+  border-radius: 0;
   overflow: auto;
+  resize: vertical;
   background: #10141b;
   color: #d7e0ea;
   font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.terminal:focus {
+  outline: 0;
 }
 
 @media (max-width: 640px) {
