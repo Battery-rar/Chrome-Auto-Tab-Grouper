@@ -24,6 +24,8 @@ const {
   FUNCTIONAL_TOPIC_STOP_WORDS,
   SOURCE_NAME_PATTERN,
   GROUP_COLORS,
+  FUNCTIONAL_SITE_GROUPS,
+  CLOUD_FINE_GRAINED_GROUPS,
   DOMAIN_DISPLAY_NAMES,
   PRODUCT_DOMAIN_GROUPS,
   TITLE_TOPIC_RULES,
@@ -146,27 +148,44 @@ async function regroupWindow(windowId) {
   let groupedTabs = 0;
   const { eligibleGroups, groupedTabIdsInOrder } = buildEligibleTabGroups(classified, settings);
   const groupedStartIndex = getFirstGroupableTabIndex(tabs);
+  const existingGroups = await queryTabGroups({ windowId });
+  const { groupIdByName, duplicateGroupIds } = selectReusableGroupsByTitle(
+    existingGroups,
+    eligibleGroups.map(([groupName]) => groupName),
+    await queryTabs({ windowId })
+  );
 
   await ungroupTabIds(getStaleGroupedTabIds(tabs, groupedTabIdsInOrder));
 
-  const createdGroups = [];
+  const targetGroups = [];
+  const currentTabsAfterUngroup = await queryTabs({ windowId });
+  const groupIdByTabId = new Map(currentTabsAfterUngroup.map((tab) => [tab.id, tab.groupId]));
   for (const [groupName, tabIds] of eligibleGroups) {
-    const groupId = await groupTabIds(tabIds);
+    const reusableGroupId = groupIdByName.get(groupName);
+    const groupId = reusableGroupId || await groupTabIds(tabIds);
+    if (reusableGroupId) {
+      const missingTabIds = tabIds.filter((tabId) => groupIdByTabId.get(tabId) !== reusableGroupId);
+      await addTabIdsToGroup(reusableGroupId, missingTabIds);
+    }
     await updateGroup(groupId, {
       title: groupName,
       color: colorForIndex(groupCount),
       collapsed: false
     });
-    createdGroups.push({ groupId, groupName, tabIds });
+    for (const tabId of tabIds) {
+      groupIdByTabId.set(tabId, groupId);
+    }
+    targetGroups.push({ groupId, groupName, tabIds });
     groupCount += 1;
     groupedTabs += tabIds.length;
   }
-  await ensureGroupMembership(windowId, createdGroups);
+  await cleanupDuplicateGroups(windowId, duplicateGroupIds, new Set(targetGroups.map((group) => group.groupId)));
+  await ensureGroupMembership(windowId, targetGroups);
   await moveTabIds(groupedTabIdsInOrder, groupedStartIndex);
-  await ensureGroupMembership(windowId, createdGroups);
+  await ensureGroupMembership(windowId, targetGroups);
 
   const skippedTabs = tabs.length - groupedTabs;
-  let resultMessage = `已整理 ${groupedTabs} 个标签，生成 ${groupCount} 个分组。`;
+  let resultMessage = `已整理 ${groupedTabs} 个标签，整理成 ${groupCount} 个分组。`;
   if (!settings.includeSingleTabGroups && groupCount === 0) {
     resultMessage = "没有形成至少 2 个标签的分类，已取消单标签分组。";
   } else if (!settings.includeSingleTabGroups && skippedTabs > 0) {
@@ -210,6 +229,52 @@ function buildEligibleTabGroups(classified, settings) {
     eligibleGroups,
     groupedTabIdsInOrder: eligibleGroups.flatMap(([, tabIds]) => tabIds)
   };
+}
+
+function selectReusableGroupsByTitle(existingGroups, targetGroupNames, currentTabs = []) {
+  const targetNameSet = new Set(targetGroupNames);
+  const tabCountsByGroupId = countBy(
+    currentTabs.filter(isTabInGroup),
+    (tab) => tab.groupId
+  );
+  const candidates = existingGroups
+    .filter((group) => targetNameSet.has(group.title || ""))
+    .sort((left, right) => {
+      const countDelta = Number(tabCountsByGroupId.get(right.id) || 0) - Number(tabCountsByGroupId.get(left.id) || 0);
+      return countDelta || left.id - right.id;
+    });
+
+  const groupIdByName = new Map();
+  const duplicateGroupIds = [];
+  for (const group of candidates) {
+    if (!groupIdByName.has(group.title)) {
+      groupIdByName.set(group.title, group.id);
+      continue;
+    }
+    duplicateGroupIds.push(group.id);
+  }
+
+  return { groupIdByName, duplicateGroupIds };
+}
+
+async function cleanupDuplicateGroups(windowId, duplicateGroupIds, protectedGroupIds) {
+  const duplicateGroupIdSet = new Set(
+    duplicateGroupIds.filter((groupId) => !protectedGroupIds.has(groupId))
+  );
+  if (!duplicateGroupIdSet.size) {
+    return;
+  }
+
+  const duplicateTabIds = (await queryTabs({ windowId }))
+    .filter((tab) => duplicateGroupIdSet.has(tab.groupId))
+    .map((tab) => tab.id);
+  await ungroupTabIds(duplicateTabIds);
+  if (duplicateTabIds.length) {
+    await appendLog("info", "已清理重复旧分组", {
+      groupIds: [...duplicateGroupIdSet],
+      tabIds: duplicateTabIds
+    });
+  }
 }
 
 function getStaleGroupedTabIds(tabs, groupedTabIds) {
@@ -287,8 +352,8 @@ function stabilizeSingletonsByDomain(items, settings) {
   const domainBuckets = new Map();
 
   for (const item of items) {
-    const domainKey = getDomainGroup(item.tab?.url || "");
     const domainName = getDomainName(item.tab?.url || "");
+    const domainKey = normalizeTopicKey(domainName);
     if (!domainKey || domainKey === "其他" || !domainName || domainName === "其他") {
       continue;
     }
@@ -397,14 +462,16 @@ async function classifyCandidateGroupsWithCloud(candidates, settings, isTest = f
   const systemPrompt = [
     "你是浏览器标签页分类器。",
     "不要输出推理过程，不要逐项解释，不要先分析；直接输出最终 JSON。",
-    "你会收到本地预处理后的候选组摘要，而不是完整标签列表。你的任务是合并候选组并给最终分组智能命名。",
-    "每个候选组有 confidence：high 表示本地已有明确功能主题、明确产品/技术主题或官方产品域名信号，通常应保留其主题；medium/low 表示只是弱标题、网站属性或普通域名兜底，必须进一步阅读标题、URL、域名和信号来判断是否能合并成更具体的功能组。",
+    "你会收到本地预处理后的候选组摘要和候选内标签线索。你的任务是像人整理浏览器一样合并候选组，并给最终分组智能命名。",
+    "不要机械照抄 suggestedName。suggestedName 只是兜底；你必须阅读 sampleTitles、tabDetails、urlHints、signals 和 intelligenceHints，判断这些标签真正是在做什么。",
+    "每个候选组有 confidence：high 表示本地已有明确功能主题、明确产品/技术主题或官方产品域名信号，通常应保留其主题；但如果 high 只是 GitHub、YouTube、哔哩哔哩、知乎、CSDN 这类来源平台名，仍然要继续看标题和 URL，优先按项目/教程对象/任务合并。medium/low 表示只是弱标题、网站属性或普通域名兜底，必须进一步阅读标题、URL、域名和信号来判断是否能合并成更具体的功能组。",
     "必须按以下多层机制判断：",
     "1. 名字/标题层：优先看标题里的主题、产品、技术栈、教程对象。不同网站、不同域名但标题主题相同的候选组必须合并到同一组。例如 YouTube、知乎、博客里的 Rime、小狼毫、鼠须管、雾凇拼音教程都归为 Rime 输入法，而不是视频、社交或各自域名。",
-    "2. 功能上下文层：教程、下载、安装、配置、部署、文档、release、GitHub 项目页如果围绕同一个对象，应合并为该对象或对象+用途，例如 Python、Foo 工具、Rime 输入法、Ollama。本地大模型教程、Ollama 下载页、Open WebUI/Ollama 相关文档如果明显围绕 Ollama，应合并到 Ollama 或 Ollama 工具链。",
-    "3. 产品域名层：preferredDomainGroups 表示官网、文档站或下载页对应的产品名，例如 Ollama、Open WebUI、Dify。它比泛化的网站属性 AI、文档、办公更具体。",
-    "4. 网站属性层：如果标题没有明确共同主题，再看网站属性，例如视频、代码、文档、邮箱、搜索、购物、社交、新闻、金融、设计、办公。",
+    "2. 功能上下文层：教程、下载、安装、配置、部署、文档、release、GitHub 项目页如果围绕同一个对象，应合并为该对象或对象+用途，例如 Python、Foo 工具、Rime 输入法、Ollama。本地大模型教程、Ollama 下载页、Open WebUI/Ollama 相关文档如果明显围绕 Ollama，应合并到 Ollama 或 Ollama 工具链。GitHub 仓库、官网、文档、下载页、教程文章如果指向同一项目，也应该归到项目名。",
+    "3. 产品/站点域名层：preferredDomainGroups 表示官网、文档站、下载页或强站点名对应的产品/站点，例如 Ollama、Open WebUI、Dify、GitHub、GitLab、Gitee。它比泛化的网站属性 AI、文档、办公、代码更具体。",
+    "4. 网站属性层：如果标题没有明确共同主题，再看网站属性，例如视频、代码、文档、邮箱、聊天、搜索、购物、社交、新闻、金融、设计、办公。邮箱、聊天是强功能属性，可以跨站合并，例如 QQ 邮箱和 Outlook 归为邮箱，WhatsApp、Telegram、Discord、企业微信归为聊天，不要被 qq.com、google.com、microsoft.com 这类大平台主域抢走。GitHub、GitLab、Gitee、Bitbucket 这类代码托管站点不要泛化成代码；只有 Stack Overflow、npm、PyPI、crates.io、pkg.go.dev 这类代码问答/包资源站点才适合用代码。",
     "5. 站点名层：如果仍不能判断，才使用站点名，例如 GitHub、Google Docs、哔哩哔哩、CSDN。",
+    "直觉规则：如果多个标签看起来是同一件事的不同入口、教程、下载、文档、源码、讨论或视频，合成一个具体主题组；如果只是同一平台上毫不相关的内容，才按平台名分开。",
     "智能命名要求：组名要尽量具体、稳定、可复用；有具体主题时用主题名或主题+类别，例如 Rime 输入法、React 文档、OpenAI API，不要用笼统的“教程”“文章”；有具体产品时用产品名，不要用网站类型。",
     "不要机械保留 suggestedName；medium/low 的候选尤其要重新分析。只有功能联系弱或证据不足时，才按站点名或域名兜底分组。",
     "不要把完整域名或域名后缀作为分组名，例如不要返回 bilibili.com、example.xyz、docs.example.co.uk。",
@@ -426,6 +493,8 @@ async function classifyCandidateGroupsWithCloud(candidates, settings, isTest = f
       confidence: candidate.confidence,
       sampleTitles: candidate.sampleTitles,
       urlHints: candidate.urlHints,
+      tabDetails: candidate.tabDetails,
+      intelligenceHints: candidate.intelligenceHints,
       domains: candidate.domains,
       signals: {
         functionalTopics: candidate.functionalTopics,
@@ -919,7 +988,7 @@ function toClassifiableTab(tab, functionalTopic = "") {
 }
 
 function getLocalSignalConfidence({ functionalTopic, titleTopic, siteProperty, domainDisplayName, preferredDomainGroup }) {
-  if (functionalTopic || preferredDomainGroup || (titleTopic && !WEAK_TITLE_GROUPS.has(titleTopic))) {
+  if (functionalTopic || preferredDomainGroup || isFunctionalSiteGroup(siteProperty) || (titleTopic && !WEAK_TITLE_GROUPS.has(titleTopic))) {
     return "high";
   }
   if (siteProperty || titleTopic) {
@@ -954,11 +1023,13 @@ function createCloudCandidate(index, item) {
     tabIds: [],
     sampleTitles: [],
     urlHints: [],
+    tabDetails: [],
+    intelligenceHints: new Set(),
     domains: new Set(),
-        functionalTopics: new Set(),
-        titleTopics: new Set(),
-        preferredDomainGroups: new Set(),
-        siteProperties: new Set(),
+    functionalTopics: new Set(),
+    titleTopics: new Set(),
+    preferredDomainGroups: new Set(),
+    siteProperties: new Set(),
     domainDisplayNames: new Set(),
     confidences: new Set()
   };
@@ -968,6 +1039,10 @@ function addItemToCloudCandidate(candidate, item) {
   candidate.tabIds.push(item.id);
   pushUnique(candidate.sampleTitles, truncateString(item.title || "", 80), 3);
   pushUnique(candidate.urlHints, compactUrl(item.url || ""), 3);
+  pushUniqueObject(candidate.tabDetails, createCloudTabDetail(item), 6);
+  for (const hint of getCloudIntelligenceHints(item)) {
+    addNonEmpty(candidate.intelligenceHints, hint);
+  }
   addNonEmpty(candidate.domains, item.domain);
   addNonEmpty(candidate.functionalTopics, item.functionalTopic);
   addNonEmpty(candidate.titleTopics, item.titleTopic);
@@ -980,6 +1055,8 @@ function addItemToCloudCandidate(candidate, item) {
 function finalizeCloudCandidate(candidate) {
   return {
     ...candidate,
+    tabDetails: candidate.tabDetails,
+    intelligenceHints: setToArray(candidate.intelligenceHints, 8),
     domains: setToArray(candidate.domains, 4),
     functionalTopics: setToArray(candidate.functionalTopics, 4),
     titleTopics: setToArray(candidate.titleTopics, 4),
@@ -1019,6 +1096,7 @@ function summarizeCandidates(candidates) {
     preferredDomainGroups: candidate.preferredDomainGroups,
     siteProperties: candidate.siteProperties,
     domainDisplayNames: candidate.domainDisplayNames,
+    intelligenceHints: candidate.intelligenceHints,
     sampleTitles: candidate.sampleTitles
   }));
 }
@@ -1035,17 +1113,101 @@ function safeEndpoint(url) {
 function getCandidateKey(item) {
   const strongGroup = item.functionalTopic
     || (item.titleTopic && !WEAK_TITLE_GROUPS.has(item.titleTopic) ? item.titleTopic : "")
-    || item.preferredDomainGroup;
+    || (isFunctionalSiteGroup(item.siteProperty) ? item.siteProperty : "")
+    || (isCloudFineGrainedGroup(item.preferredDomainGroup) ? "" : item.preferredDomainGroup);
   if (strongGroup) {
     return `strong:${normalizeTopicKey(strongGroup)}`;
   }
+  if (isCloudFineGrainedGroup(item.preferredDomainGroup || item.domainDisplayName)) {
+    return `tab:${item.id}`;
+  }
   return `tab:${item.id}`;
+}
+
+function isFunctionalSiteGroup(group) {
+  return Boolean(group && FUNCTIONAL_SITE_GROUPS.has(group));
+}
+
+function isCloudFineGrainedGroup(group) {
+  return Boolean(group && CLOUD_FINE_GRAINED_GROUPS.has(group));
+}
+
+function createCloudTabDetail(item) {
+  return {
+    tabId: item.id,
+    title: truncateString(item.title || "", 120),
+    url: compactUrl(item.url || ""),
+    domain: item.domain,
+    signals: compactObject({
+      functionalTopic: item.functionalTopic,
+      titleTopic: item.titleTopic,
+      preferredDomainGroup: item.preferredDomainGroup,
+      siteProperty: item.siteProperty,
+      domainDisplayName: item.domainDisplayName
+    })
+  };
+}
+
+function getCloudIntelligenceHints(item) {
+  const hints = [];
+  const githubRepository = extractGithubRepositoryParts(item.url || "");
+  if (githubRepository) {
+    hints.push(`githubRepo:${githubRepository.owner}/${githubRepository.repo}`);
+    hints.push(`repoName:${githubRepository.repo}`);
+  }
+
+  const pathTopic = extractPathTopicHint(item.url || "");
+  if (pathTopic) {
+    hints.push(`pathTopic:${pathTopic}`);
+  }
+
+  for (const topic of extractFunctionalTopicCandidates(item.title || "")) {
+    const clean = cleanFunctionalTopicCandidate(topic);
+    if (isUsefulFunctionalTopic(clean)) {
+      hints.push(`titleTopicCandidate:${formatFunctionalTopic(clean)}`);
+    }
+  }
+
+  return hints.slice(0, 6);
+}
+
+function extractPathTopicHint(url) {
+  try {
+    const parsed = new URL(url);
+    const parts = parsed.pathname
+      .split("/")
+      .map((part) => decodeURIComponent(part || "").trim())
+      .filter(Boolean)
+      .filter((part) => !/^\d+$/.test(part))
+      .filter((part) => !/^(watch|video|questions|package|project|docs?|documentation|releases?|issues?|pull|tree|blob)$/i.test(part));
+    const useful = parts.find((part) => /[a-z0-9\u4e00-\u9fa5]/i.test(part) && part.length >= 2);
+    return useful ? truncateString(useful.replace(/\.(html?|md|git)$/i, ""), 40) : "";
+  } catch {
+    return "";
+  }
+}
+
+function compactObject(object) {
+  return Object.fromEntries(
+    Object.entries(object).filter(([, value]) => Boolean(value))
+  );
 }
 
 function pushUnique(list, value, maxLength) {
   if (value && !list.includes(value) && list.length < maxLength) {
     list.push(value);
   }
+}
+
+function pushUniqueObject(list, value, maxLength) {
+  if (!value || list.length >= maxLength) {
+    return;
+  }
+  const key = JSON.stringify(value);
+  if (list.some((item) => JSON.stringify(item) === key)) {
+    return;
+  }
+  list.push(value);
 }
 
 function addNonEmpty(set, value) {
@@ -1085,6 +1247,10 @@ function chooseLocalGroup({ titleTopic, siteProperty, domainDisplayName, preferr
     return titleTopic;
   }
 
+  if (isFunctionalSiteGroup(siteProperty)) {
+    return siteProperty;
+  }
+
   if (preferredDomainGroup) {
     return preferredDomainGroup;
   }
@@ -1100,12 +1266,20 @@ function chooseLocalGroup({ titleTopic, siteProperty, domainDisplayName, preferr
   return domainDisplayName || "其他";
 }
 
-function getTitleGroup(title, _url) {
-  const text = normalizeText(title);
+function getTitleGroup(title, url = "") {
+  const rawText = normalizeText(title);
+  const cleanText = normalizeText(stripTitleBoilerplate(title));
+  const texts = cleanText && cleanText !== rawText ? [cleanText, rawText] : [rawText];
+  const githubRepository = extractGithubRepositoryParts(url);
 
-  for (const rule of TITLE_TOPIC_RULES) {
-    if (rule.pattern.test(text)) {
-      return rule.group;
+  for (const text of texts) {
+    for (const rule of TITLE_TOPIC_RULES) {
+      if (rule.pattern.test(text)) {
+        if (isGithubOwnerOnlyTopic(rule.group, githubRepository)) {
+          continue;
+        }
+        return rule.group;
+      }
     }
   }
 
@@ -1113,15 +1287,20 @@ function getTitleGroup(title, _url) {
 }
 
 function getFunctionalTopic(tab) {
+  const githubRepositoryTopic = extractGithubRepositoryTopic(tab.url || "");
+  if (githubRepositoryTopic) {
+    const clean = cleanFunctionalTopicCandidate(githubRepositoryTopic);
+    if (isUsefulFunctionalTopic(clean)) {
+      return formatFunctionalTopic(clean);
+    }
+  }
+
   const titleGroup = getTitleGroup(tab.title || "", tab.url || "");
   if (titleGroup && !WEAK_TITLE_GROUPS.has(titleGroup)) {
     return titleGroup;
   }
 
-  const candidates = [
-    ...extractFunctionalTopicCandidates(tab.title || ""),
-    extractGithubRepositoryTopic(tab.url || "")
-  ].filter(Boolean);
+  const candidates = extractFunctionalTopicCandidates(tab.title || "").filter(Boolean);
 
   for (const candidate of candidates) {
     const clean = cleanFunctionalTopicCandidate(candidate);
@@ -1177,20 +1356,38 @@ function getPrefixTopicCandidates(prefix) {
 }
 
 function extractGithubRepositoryTopic(url) {
+  const repository = extractGithubRepositoryParts(url);
+  return repository?.repo?.replace(/\.git$/i, "") || "";
+}
+
+function extractGithubRepositoryParts(url) {
   try {
     const parsed = new URL(url);
     const hostname = parsed.hostname.toLowerCase().replace(/^www\./, "");
     if (hostname !== "github.com") {
-      return "";
+      return null;
     }
     const [, owner, repo] = parsed.pathname.split("/");
     if (!owner || !repo) {
-      return "";
+      return null;
     }
-    return repo.replace(/\.git$/i, "");
+    return {
+      owner: owner.replace(/\.git$/i, ""),
+      repo: repo.replace(/\.git$/i, "")
+    };
   } catch {
-    return "";
+    return null;
   }
+}
+
+function isGithubOwnerOnlyTopic(group, repository) {
+  if (!repository?.owner || !group) {
+    return false;
+  }
+  const groupKey = normalizeTopicKey(group);
+  const ownerKey = normalizeTopicKey(repository.owner);
+  const repoKey = normalizeTopicKey(repository.repo);
+  return Boolean(groupKey && ownerKey && groupKey === ownerKey && groupKey !== repoKey);
 }
 
 function stripTitleBoilerplate(title) {
@@ -1531,6 +1728,19 @@ function queryTabs(queryInfo) {
         reject(new Error(error.message));
       } else {
         resolve(tabs || []);
+      }
+    });
+  });
+}
+
+function queryTabGroups(queryInfo) {
+  return new Promise((resolve, reject) => {
+    chrome.tabGroups.query(queryInfo, (groups) => {
+      const error = chrome.runtime.lastError;
+      if (error) {
+        reject(new Error(error.message));
+      } else {
+        resolve(groups || []);
       }
     });
   });
