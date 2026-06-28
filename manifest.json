@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "Auto Tab Grouper",
-  "version": "0.5.13",
+  "name": "自动标签分组",
+  "version": "0.5.17",
   "description": "点击后按标题、网站属性、域名或 AI 分类整理 Chrome 标签页分组。",
   "minimum_chrome_version": "114",
   "permissions": [
@@ -22,7 +22,7 @@
     "128": "assets/icon-128.png"
   },
   "action": {
-    "default_title": "Auto Tab Grouper",
+    "default_title": "自动标签分组",
     "default_popup": "src/popup.html",
     "default_icon": {
       "16": "assets/icon-16.png",

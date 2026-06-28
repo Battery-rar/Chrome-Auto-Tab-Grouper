@@ -1,6 +1,6 @@
 const SETTINGS_KEY = "autoTabGrouperSettings";
 const CACHE_KEY = "autoTabGrouperCloudCache";
-const CLOUD_CACHE_VERSION = "2026-06-15-search-forum-ai-v1";
+const CLOUD_CACHE_VERSION = "2026-06-15-tab-batch-ai-v1";
 const LAST_STATUS_KEY = "autoTabGrouperLastStatus";
 const LOG_KEY = "autoTabGrouperLogs";
 
@@ -105,8 +105,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
     if (message?.type === "test-cloud") {
       const settings = await getSettings();
-      const result = await classifyCandidateGroupsWithCloud(
-        buildCloudCandidates([
+      const testItems = [
           toClassifiableTab({
             id: 1,
             title: "React Documentation",
@@ -117,7 +116,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             title: "OpenAI API Reference",
             url: "https://platform.openai.com/docs/api-reference"
           })
-        ]),
+      ];
+      const result = await classifyTabBatchWithCloud(
+        testItems,
+        buildCloudCandidates(testItems),
         settings,
         true
       );
@@ -422,19 +424,17 @@ async function classifyTabsWithCache(tabs, settings) {
   const candidates = buildCloudCandidates(items);
   await appendLog("info", "准备云端分类", {
     tabs: tabs.length,
+    mode: "tab-batch",
     candidates: candidates.length,
     candidateSummary: summarizeCandidates(candidates)
   });
-  const cloudResults = candidates.length > 0
-    ? await classifyCandidateGroupsWithCloud(candidates, settings)
+  const cloudResults = items.length > 0
+    ? await classifyTabBatchWithCloud(items, candidates, settings)
     : [];
-  const candidateGroups = new Map(cloudResults.map((result) => [result.candidateId, result.group]));
-  const candidateByTabId = new Map(
-    candidates.flatMap((candidate) => candidate.tabIds.map((id) => [id, candidate]))
-  );
+  const groupByTabId = new Map(cloudResults.map((result) => [Number(result.tabId), result.group]));
   const classified = tabs.map((tab) => ({
     tab,
-    group: candidateGroups.get(candidateByTabId.get(tab.id)?.candidateId) || localFallbackByTabId.get(tab.id) || getLocalGroup(tab)
+    group: groupByTabId.get(tab.id) || localFallbackByTabId.get(tab.id) || getLocalGroup(tab)
   }));
 
   cache[batchKey] = {
@@ -446,62 +446,57 @@ async function classifyTabsWithCache(tabs, settings) {
   return classified;
 }
 
-async function classifyCandidateGroupsWithCloud(candidates, settings, isTest = false) {
+async function classifyTabBatchWithCloud(items, candidates, settings, isTest = false) {
   assertCloudSettings(settings);
 
   const apiUrl = settings.cloudApiUrl.trim();
   const isResponsesEndpoint = /\/responses\/?$/.test(new URL(apiUrl).pathname);
-  const headers = {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${settings.cloudApiKey.trim()}`
-  };
   const requestMeta = {
     endpoint: safeEndpoint(apiUrl),
     endpointType: isResponsesEndpoint ? "responses" : "chat-completions",
     model: settings.cloudModel.trim(),
-    candidates: candidates.length
+    tabs: items.length,
+    candidates: candidates.length,
+    batchMode: "tabIds"
   };
 
   const systemPrompt = [
     "你是浏览器标签页分类器。",
     "不要输出推理过程，不要逐项解释，不要先分析；直接输出最终 JSON。",
-    "你会收到本地预处理后的候选组摘要和候选内标签线索。你的任务是像人整理浏览器一样合并候选组，并给最终分组智能命名。",
-    "不要机械照抄 suggestedName。suggestedName 只是兜底；你必须阅读 sampleTitles、tabDetails、urlHints、signals 和 intelligenceHints，判断这些标签真正是在做什么。",
-    "每个候选组有 confidence：high 表示本地已有明确功能主题、明确产品/技术主题或官方产品域名信号，通常应保留其主题；但如果 high 只是 GitHub、YouTube、哔哩哔哩、知乎、Reddit、Quora、CSDN、Google、Bing、百度这类来源平台名，仍然要继续看标题、URL 和 searchQuery，优先按项目/教程对象/任务合并。medium/low 表示只是弱标题、网站属性或普通域名兜底，必须进一步阅读标题、URL、域名和信号来判断是否能合并成更具体的功能组。",
+    "你会收到当前窗口的每个标签页，以及本地规则预聚合出的候选组提示。你的任务是像人整理浏览器一样，一次性把所有标签页分成直觉上合理的组，并给最终分组智能命名。",
+    "本地候选组只是辅助线索，不是硬约束。你可以合并候选组，也可以把候选组里的某个 tab 单独移到更合适的组。",
     "必须按以下多层机制判断：",
-    "1. 名字/标题层：优先看标题里的主题、产品、技术栈、教程对象。不同网站、不同域名但标题主题相同的候选组必须合并到同一组。例如 YouTube、知乎、博客里的 Rime、小狼毫、鼠须管、雾凇拼音教程都归为 Rime 输入法，而不是视频、社交或各自域名。",
-    "2. 功能上下文层：教程、下载、安装、配置、部署、文档、release、GitHub 项目页如果围绕同一个对象，应合并为该对象或对象+用途，例如 Python、Foo 工具、Rime 输入法、Ollama。本地大模型教程、Ollama 下载页、Open WebUI/Ollama 相关文档如果明显围绕 Ollama，应合并到 Ollama 或 Ollama 工具链。GitHub 仓库、官网、文档、下载页、教程文章、论坛讨论如果指向同一项目，也应该归到项目名。",
-    "3. 产品/站点域名层：preferredDomainGroups 表示官网、文档站、下载页或强站点名对应的产品/站点，例如 Ollama、Open WebUI、Dify、GitHub、GitLab、Gitee。它比泛化的网站属性 AI、文档、办公、代码更具体。",
-    "4. 网站属性层：如果标题没有明确共同主题，再看网站属性，例如视频、代码、文档、邮箱、聊天、搜索、论坛、AI、购物、社交、新闻、金融、设计、办公。邮箱、聊天是强功能属性，可以跨站合并，例如 QQ 邮箱和 Outlook 归为邮箱，WhatsApp、Telegram、Discord、企业微信归为聊天，不要被 qq.com、google.com、microsoft.com 这类大平台主域抢走。GitHub、GitLab、Gitee、Bitbucket 这类代码托管站点不要泛化成代码；只有 Stack Overflow、npm、PyPI、crates.io、pkg.go.dev 这类代码问答/包资源站点才适合用代码。",
-    "搜索引擎特殊规则：Google、Bing、百度、DuckDuckGo、Kagi、Brave Search、搜狗、360 搜索等搜索页如果有 searchQuery，必须优先根据 searchQuery 归到相关主题。例如搜索 Ollama 下载应归到 Ollama；搜索 Rime 配置应归到 Rime 输入法。只有搜索词无法与任何其他候选或主题建立联系时，才归为搜索或具体搜索引擎。",
-    "论坛/问答特殊规则：Reddit、Quora、知乎、V2EX、贴吧、豆瓣、Hacker News 等如果讨论的是某个产品、技术或任务，应归到该主题；只有看不出具体主题或多个论坛页都只是泛讨论时，才归为论坛或站点名。",
+    "1. 名字/标题层：优先看标题、搜索词、URL 路径里的主题、产品、技术栈、教程对象。不同网站但围绕同一对象的教程、下载、文档、源码、论坛讨论、视频，应合并为具体主题组，例如 Rime 输入法、Ollama、OpenAI API。",
+    "2. 功能上下文层：如果多个标签明显是在完成同一件事，例如安装、配置、部署、下载、阅读文档、查看 GitHub 项目或讨论同一工具，应归到该对象或对象+用途，而不是按网站类型分开。",
+    "3. 产品/站点域名层：preferredDomainGroup 表示官网、文档站、下载页或强站点名对应的产品/站点。它比泛化的网站属性更具体，但 GitHub、YouTube、哔哩哔哩、知乎、Reddit、Quora、Google、Bing、百度等来源平台名仍要继续看标题、URL 和 searchQuery。",
+    "4. 网站属性层：如果标题没有明确共同主题，再看网站属性，例如视频、代码、文档、邮箱、聊天、搜索、论坛、AI、购物、社交、新闻、金融、设计、办公。邮箱和聊天可以跨站合并；代码托管站点优先按具体仓库或项目，不要一概叫代码。",
+    "搜索引擎特殊规则：搜索页如果有 searchQuery，优先按搜索词指向的主题归类；只有搜索词无法和任何主题建立联系时，才归为搜索或具体搜索引擎。",
+    "论坛/问答特殊规则：Reddit、Quora、知乎、V2EX、贴吧、豆瓣、Hacker News 等如果讨论具体产品、技术或任务，应归到该主题；看不出主题时才归为论坛或站点名。",
     "AI 产品规则：国内外 AI 工具和模型站点应尽量按产品名命名，例如 ChatGPT/OpenAI、Claude、DeepSeek、Kimi、通义千问、豆包、Gemini、Grok、Perplexity、Microsoft Copilot、腾讯元宝、腾讯混元、Mistral、Groq、Hugging Face、硅基流动、魔搭社区等。",
     "5. 站点名层：如果仍不能判断，才使用站点名，例如 GitHub、Google Docs、哔哩哔哩、CSDN。",
-    "直觉规则：如果多个标签看起来是同一件事的不同入口、教程、下载、文档、源码、讨论或视频，合成一个具体主题组；如果只是同一平台上毫不相关的内容，才按平台名分开。",
-    "智能命名要求：组名要尽量具体、稳定、可复用；有具体主题时用主题名或主题+类别，例如 Rime 输入法、React 文档、OpenAI API，不要用笼统的“教程”“文章”；有具体产品时用产品名，不要用网站类型。",
-    "不要机械保留 suggestedName；medium/low 的候选尤其要重新分析。只有功能联系弱或证据不足时，才按站点名或域名兜底分组。",
+    "直觉规则：功能联系强时按具体主题分组；功能联系弱时按站点名或网站属性兜底。不要为了显得聪明而把无关内容硬合并。",
+    "智能命名要求：组名要具体、稳定、可复用；有具体主题时用主题名或主题+类别，不要用笼统的“教程”“文章”；有具体产品时用产品名，不要用网站类型。",
     "不要把完整域名或域名后缀作为分组名，例如不要返回 bilibili.com、example.xyz、docs.example.co.uk。",
-    "分组名最长 12 个中文字符。必须覆盖每个输入 candidateId，且每个 candidateId 只能出现在一个返回组里。",
+    "分组名最长 12 个中文字符。必须覆盖每个输入 tabId，且每个 tabId 只能出现在一个返回组里。",
     "输出必须是纯 JSON 对象，不能包含 Markdown、代码块、解释文字或前后缀。",
-    "唯一允许格式：{\"groups\":[{\"candidateIds\":[\"c1\",\"c2\"],\"group\":\"Rime 输入法\"}]}。"
+    "唯一允许格式：{\"groups\":[{\"tabIds\":[1,2],\"group\":\"Rime 输入法\"}]}。"
   ].join("\n");
 
   const userPrompt = JSON.stringify({
     rules: {
-      priority: ["functionalTopic", "titleTopic", "preferredDomainGroup", "siteProperty", "domainDisplayName"],
-      useProvidedSignalsAsHints: true,
+      priority: ["functionalTopic", "titleTopic", "searchQueryTopic", "preferredDomainGroup", "siteProperty", "domainDisplayName"],
+      batchMode: "classifyEachTabThenMerge",
+      localCandidatesAreHintsOnly: true,
       avoidDomainSuffixInGroupNames: true
     },
-    candidates: candidates.map((candidate) => ({
+    tabs: items.map(createCloudBatchTab),
+    localCandidateHints: candidates.map((candidate) => ({
       candidateId: candidate.candidateId,
       tabIds: candidate.tabIds,
       suggestedName: candidate.suggestedName,
       confidence: candidate.confidence,
       sampleTitles: candidate.sampleTitles,
-      urlHints: candidate.urlHints,
-      tabDetails: candidate.tabDetails,
       intelligenceHints: candidate.intelligenceHints,
-      domains: candidate.domains,
       signals: {
         functionalTopics: candidate.functionalTopics,
         titleTopics: candidate.titleTopics,
@@ -513,6 +508,40 @@ async function classifyCandidateGroupsWithCloud(candidates, settings, isTest = f
     }))
   });
 
+  const resultGroups = await requestCloudGroups({
+    settings,
+    requestMeta,
+    systemPrompt,
+    userPrompt
+  });
+  await appendLog("info", "AI 批量分组解析结果", resultGroups);
+
+  if (isTest && resultGroups.length === 0) {
+    throw new Error("API 返回成功，但没有 groups 分类结果。");
+  }
+
+  const candidateById = new Map(candidates.map((candidate) => [candidate.candidateId, candidate]));
+  return resultGroups.flatMap((group) => {
+    const groupName = normalizeReturnedGroupName(group.group);
+    const tabIds = getTabIdsFromGroup(group, candidateById);
+    return tabIds
+      .map((tabId) => ({
+        tabId: Number(tabId),
+        group: groupName
+      }))
+      .filter((item) => Number.isFinite(item.tabId) && item.group);
+  });
+}
+
+async function requestCloudGroups({ settings, requestMeta, systemPrompt, userPrompt }) {
+  assertCloudSettings(settings);
+
+  const apiUrl = settings.cloudApiUrl.trim();
+  const isResponsesEndpoint = /\/responses\/?$/.test(new URL(apiUrl).pathname);
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${settings.cloudApiKey.trim()}`
+  };
   const disableThinking = shouldSendThinkingDisable(settings);
   const attempts = getCloudRequestAttempts(disableThinking);
   let data;
@@ -570,23 +599,7 @@ async function classifyCandidateGroupsWithCloud(candidates, settings, isTest = f
   const content = extractModelContent(data);
   await appendLog("ai", "AI 返回内容", content);
   const parsed = parseModelJson(content);
-  const resultGroups = normalizeResultGroups(parsed);
-  await appendLog("info", "AI 分组解析结果", resultGroups);
-
-  if (isTest && resultGroups.length === 0) {
-    throw new Error("API 返回成功，但没有 groups 分类结果。");
-  }
-
-  return resultGroups.flatMap((group) => {
-    const groupName = normalizeReturnedGroupName(group.group);
-    const candidateIds = getCandidateIdsFromGroup(group);
-    return candidateIds
-      .map((candidateId) => ({
-        candidateId: String(candidateId),
-        group: groupName
-      }))
-      .filter((item) => item.candidateId && item.group);
-  });
+  return normalizeResultGroups(parsed);
 }
 
 function getCloudRequestAttempts(disableThinking) {
@@ -929,7 +942,7 @@ function normalizeParsedJson(parsed) {
   if (Array.isArray(parsed?.items)) {
     return { groups: parsed.items };
   }
-  if (parsed?.candidateIds || parsed?.group) {
+  if (parsed?.candidateIds || parsed?.tabIds || parsed?.tabId || parsed?.group) {
     return { groups: [parsed] };
   }
   return parsed || {};
@@ -948,6 +961,16 @@ function normalizeResultGroups(parsed) {
     if (looksLikeCandidateMap) {
       return entries.map(([candidateId, group]) => ({
         candidateIds: [candidateId],
+        group
+      }));
+    }
+
+    const looksLikeTabMap = entries.length > 0 && entries.every(([key, value]) => {
+      return /^(?:t)?\d+$/i.test(key) && typeof value === "string";
+    });
+    if (looksLikeTabMap) {
+      return entries.map(([tabId, group]) => ({
+        tabIds: [String(tabId).replace(/^t/i, "")],
         group
       }));
     }
@@ -971,6 +994,35 @@ function getCandidateIdsFromGroup(group) {
   }
   if (group.id && /^c\d+$/i.test(String(group.id))) {
     return [group.id];
+  }
+  return [];
+}
+
+function getTabIdsFromGroup(group, candidateById = new Map()) {
+  const directTabIds = getDirectTabIdsFromGroup(group);
+  if (directTabIds.length > 0) {
+    return directTabIds;
+  }
+
+  return getCandidateIdsFromGroup(group)
+    .flatMap((candidateId) => candidateById.get(String(candidateId))?.tabIds || []);
+}
+
+function getDirectTabIdsFromGroup(group) {
+  if (Array.isArray(group.tabIds)) {
+    return group.tabIds;
+  }
+  if (Array.isArray(group.tabs)) {
+    return group.tabs.map((item) => typeof item === "object" ? item.tabId || item.id : item);
+  }
+  if (Array.isArray(group.ids)) {
+    return group.ids.filter((id) => /^(?:t)?\d+$/i.test(String(id)));
+  }
+  if (group.tabId) {
+    return [group.tabId];
+  }
+  if (group.id && /^(?:t)?\d+$/i.test(String(group.id))) {
+    return [String(group.id).replace(/^t/i, "")];
   }
   return [];
 }
@@ -1067,8 +1119,6 @@ function createCloudCandidate(index, item) {
     suggestedName: item.localFallback || item.domainDisplayName || "其他",
     tabIds: [],
     sampleTitles: [],
-    urlHints: [],
-    tabDetails: [],
     intelligenceHints: new Set(),
     domains: new Set(),
     functionalTopics: new Set(),
@@ -1084,8 +1134,6 @@ function createCloudCandidate(index, item) {
 function addItemToCloudCandidate(candidate, item) {
   candidate.tabIds.push(item.id);
   pushUnique(candidate.sampleTitles, truncateString(item.title || "", 80), 3);
-  pushUnique(candidate.urlHints, compactUrl(item.url || ""), 3);
-  pushUniqueObject(candidate.tabDetails, createCloudTabDetail(item), 6);
   for (const hint of getCloudIntelligenceHints(item)) {
     addNonEmpty(candidate.intelligenceHints, hint);
   }
@@ -1102,7 +1150,6 @@ function addItemToCloudCandidate(candidate, item) {
 function finalizeCloudCandidate(candidate) {
   return {
     ...candidate,
-    tabDetails: candidate.tabDetails,
     intelligenceHints: setToArray(candidate.intelligenceHints, 8),
     domains: setToArray(candidate.domains, 4),
     functionalTopics: setToArray(candidate.functionalTopics, 4),
@@ -1182,14 +1229,17 @@ function isCloudFineGrainedGroup(group) {
   return Boolean(group && CLOUD_FINE_GRAINED_GROUPS.has(group));
 }
 
-function createCloudTabDetail(item) {
+function createCloudBatchTab(item) {
   return {
     tabId: item.id,
-      title: truncateString(item.title || "", 120),
-      url: compactUrl(item.url || ""),
-      domain: item.domain,
-      searchQuery: item.searchQuery || "",
-      signals: compactObject({
+    title: truncateString(item.title || "", 140),
+    url: compactUrl(item.url || ""),
+    domain: item.domain,
+    searchQuery: item.searchQuery || "",
+    localFallback: item.localFallback,
+    confidence: item.confidence,
+    intelligenceHints: getCloudIntelligenceHints(item),
+    signals: compactObject({
       functionalTopic: item.functionalTopic,
       titleTopic: item.titleTopic,
       searchQueryTopic: item.searchQueryTopic,
@@ -1253,17 +1303,6 @@ function pushUnique(list, value, maxLength) {
   if (value && !list.includes(value) && list.length < maxLength) {
     list.push(value);
   }
-}
-
-function pushUniqueObject(list, value, maxLength) {
-  if (!value || list.length >= maxLength) {
-    return;
-  }
-  const key = JSON.stringify(value);
-  if (list.some((item) => JSON.stringify(item) === key)) {
-    return;
-  }
-  list.push(value);
 }
 
 function addNonEmpty(set, value) {

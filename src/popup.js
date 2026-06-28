@@ -1,4 +1,3 @@
-const modeBadge = document.querySelector("#modeBadge");
 const statusText = document.querySelector("#status");
 const regroupButton = document.querySelector("#regroupNow");
 const optionsButton = document.querySelector("#options");
@@ -11,26 +10,34 @@ loadPopup();
 async function loadPopup() {
   const response = await sendMessage({ type: "get-settings" });
   if (!response.ok) {
-    statusText.textContent = response.error || "读取状态失败。";
+    statusText.textContent = "读取失败。";
     return;
   }
 
-  const settings = response.settings;
-  modeBadge.textContent = settings.mode === "cloud" ? "云端 AI" : "本地规则";
-  statusText.textContent = response.status?.message || "尚未运行。";
+  statusText.textContent = response.status?.ok === false ? "上次失败。" : "";
 }
 
 async function regroupNow() {
-  regroupButton.disabled = true;
-  statusText.textContent = "正在整理当前窗口…";
-  const response = await sendMessage({ type: "regroup-now" });
-  regroupButton.disabled = false;
+  await spinButton(regroupButton, async () => {
+    statusText.textContent = "";
+    const response = await sendMessage({ type: "regroup-now" });
 
-  if (response.ok) {
-    const { groupedTabs, groups, message } = response.result;
-    statusText.textContent = message || `已整理 ${groupedTabs} 个标签，生成 ${groups} 个分组。`;
-  } else {
-    statusText.textContent = response.error || "分组失败。";
+    if (response.ok) {
+      statusText.textContent = response.result?.warning ? "整理失败。" : "";
+    } else {
+      statusText.textContent = "整理失败。";
+    }
+  });
+}
+
+async function spinButton(btn, fn) {
+  btn.classList.add("loading");
+  try {
+    await fn();
+  } finally {
+    btn.classList.remove("loading");
+    btn.classList.add("done");
+    setTimeout(() => btn.classList.remove("done"), 1500);
   }
 }
 

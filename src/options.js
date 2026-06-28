@@ -43,49 +43,55 @@ async function loadSettings() {
 }
 
 async function saveSettings() {
-  const mode = document.querySelector('input[name="mode"]:checked')?.value || "local";
-  const settings = {
-    mode,
-    includeSingleTabGroups: fields.includeSingleTabGroups.checked,
-    cloudApiUrl: fields.cloudApiUrl.value.trim(),
-    cloudApiKey: fields.cloudApiKey.value.trim(),
-    cloudModel: fields.cloudModel.value.trim(),
-    cacheTtlHours: Number(fields.cacheTtlHours.value || 24),
-    disableThinking: !fields.enableThinking.checked
-  };
+  await spinButton(document.querySelector("#save"), async () => {
+    const mode = document.querySelector('input[name="mode"]:checked')?.value || "local";
+    const settings = {
+      mode,
+      includeSingleTabGroups: fields.includeSingleTabGroups.checked,
+      cloudApiUrl: fields.cloudApiUrl.value.trim(),
+      cloudApiKey: fields.cloudApiKey.value.trim(),
+      cloudModel: fields.cloudModel.value.trim(),
+      cacheTtlHours: Number(fields.cacheTtlHours.value || 24),
+      disableThinking: !fields.enableThinking.checked
+    };
 
-  const response = await sendMessage({ type: "save-settings", settings });
-  if (response.ok) {
-    setStatus("设置已保存。", true);
-  } else {
-    setStatus(response.error || "保存失败。", false);
-  }
+    const response = await sendMessage({ type: "save-settings", settings });
+    if (response.ok) {
+      setStatus("设置已保存。", true);
+    } else {
+      setStatus(response.error || "保存失败。", false);
+    }
+  });
 }
 
 async function testCloud() {
   await saveSettings();
-  setStatus("正在测试云端分类…", true);
-  const response = await sendMessage({ type: "test-cloud" });
-  if (response.ok) {
-    const groups = response.result.map((item) => `${item.candidateId}: ${item.group}`).join("；");
-    setStatus(`云端分类可用：${groups || "已返回结果"}`, true);
-  } else {
-    setStatus(response.error || "云端分类测试失败。", false);
-  }
-  await refreshLogs({ force: true });
+  await spinButton(document.querySelector("#testCloud"), async () => {
+    setStatus("正在测试云端分类…", true);
+    const response = await sendMessage({ type: "test-cloud" });
+    if (response.ok) {
+      const groups = response.result.map((item) => `${item.candidateId}: ${item.group}`).join("；");
+      setStatus(`云端分类可用：${groups || "已返回结果"}`, true);
+    } else {
+      setStatus(response.error || "云端分类测试失败。", false);
+    }
+    await refreshLogs({ force: true });
+  });
 }
 
 async function regroupNow() {
   await saveSettings();
-  setStatus("正在整理当前窗口…", true);
-  const response = await sendMessage({ type: "regroup-now" });
-  if (response.ok) {
-    const { groupedTabs, groups, message, warning } = response.result;
-    setStatus(message || `已整理 ${groupedTabs} 个标签，生成 ${groups} 个分组。`, !warning);
-  } else {
-    setStatus(response.error || "立即分组失败。", false);
-  }
-  await refreshLogs({ force: true });
+  await spinButton(document.querySelector("#regroupNow"), async () => {
+    setStatus("正在整理当前窗口…", true);
+    const response = await sendMessage({ type: "regroup-now" });
+    if (response.ok) {
+      const { groupedTabs, groups, message, warning } = response.result;
+      setStatus(message || `已整理 ${groupedTabs} 个标签，生成 ${groups} 个分组。`, !warning);
+    } else {
+      setStatus(response.error || "立即分组失败。", false);
+    }
+    await refreshLogs({ force: true });
+  });
 }
 
 async function refreshLogs({ force = false } = {}) {
@@ -112,6 +118,17 @@ async function clearLogs() {
     await refreshLogs({ force: true });
   } else {
     setStatus(response.error || "清空日志失败。", false);
+  }
+}
+
+async function spinButton(btn, fn) {
+  btn.classList.add("loading");
+  try {
+    await fn();
+  } finally {
+    btn.classList.remove("loading");
+    btn.classList.add("done");
+    setTimeout(() => btn.classList.remove("done"), 1500);
   }
 }
 
