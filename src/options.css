@@ -89,7 +89,7 @@ h2 {
   display: inline-grid;
   grid-template-columns: repeat(2, minmax(110px, 1fr));
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: 12px;
   overflow: hidden;
   margin-bottom: 16px;
   background: var(--input-bg);
@@ -198,40 +198,8 @@ button.primary:hover {
   background: var(--primary-strong);
 }
 
-button.primary.loading,
-button.primary.done {
-  color: transparent;
-}
-
-button.primary.loading::after {
-  content: "";
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 14px;
-  height: 14px;
-  transform: translate(-50%, -50%);
-  border: 2px solid rgba(255, 255, 255, 0.3);
-  border-top-color: #fff;
-  border-radius: 50%;
-  animation: spin 0.6s linear infinite;
-}
-
-button.primary.done::after {
-  content: "✓";
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  color: #fff;
-  font-size: 16px;
-}
-
-@keyframes spin {
-  to {
-    transform: translate(-50%, -50%) rotate(360deg);
-  }
-}
+/* ponytail: shared button states extracted to common.css */
+button.primary.done::after { font-size: 16px; }
 
 .status {
   min-height: 22px;

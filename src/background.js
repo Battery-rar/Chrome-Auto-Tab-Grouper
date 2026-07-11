@@ -1,6 +1,6 @@
 const SETTINGS_KEY = "autoTabGrouperSettings";
 const CACHE_KEY = "autoTabGrouperCloudCache";
-const CLOUD_CACHE_VERSION = "2026-06-15-tab-batch-ai-v1";
+const CLOUD_CACHE_VERSION = "2026-07-12-cloud-ai-v3";
 const LAST_STATUS_KEY = "autoTabGrouperLastStatus";
 const LOG_KEY = "autoTabGrouperLogs";
 
@@ -16,7 +16,10 @@ const DEFAULT_SETTINGS = {
 
 const CLOUD_TIMEOUT_MS = 60000;
 const CLOUD_MAX_OUTPUT_TOKENS = 4096;
+const CLOUD_DEEPSEEK_MAX_OUTPUT_TOKENS = 8192;
 const CLOUD_FETCH_RETRY_DELAYS_MS = [700, 1800];
+const TAB_MOVE_SETTLE_DELAY_MS = 120;
+const TAB_MOVE_MAX_VERIFY_ATTEMPTS = 3;
 const MAX_LOG_ENTRIES = 120;
 const MAX_LOG_DETAIL_LENGTH = 5000;
 loadRuleDefinitions();
@@ -160,11 +163,9 @@ async function regroupWindow(windowId) {
     await queryTabs({ windowId })
   );
 
-  await ungroupTabIds(getStaleGroupedTabIds(tabs, groupedTabIdsInOrder));
-
   const targetGroups = [];
-  const currentTabsAfterUngroup = await queryTabs({ windowId });
-  const groupIdByTabId = new Map(currentTabsAfterUngroup.map((tab) => [tab.id, tab.groupId]));
+  const currentTabsBeforeGrouping = await queryTabs({ windowId });
+  const groupIdByTabId = new Map(currentTabsBeforeGrouping.map((tab) => [tab.id, tab.groupId]));
   for (const [groupName, tabIds] of eligibleGroups) {
     const reusableGroupId = groupIdByName.get(groupName);
     const groupId = reusableGroupId || await groupTabIds(tabIds);
@@ -184,10 +185,13 @@ async function regroupWindow(windowId) {
     groupCount += 1;
     groupedTabs += tabIds.length;
   }
+
+  await ungroupTabIds(getStaleGroupedTabIds(await queryTabs({ windowId }), groupedTabIdsInOrder));
   await cleanupDuplicateGroups(windowId, duplicateGroupIds, new Set(targetGroups.map((group) => group.groupId)));
   await ensureGroupMembership(windowId, targetGroups);
-  await moveTabIds(groupedTabIdsInOrder, groupedStartIndex);
+  await ensureTabOrder(windowId, groupedTabIdsInOrder, groupedStartIndex);
   await ensureGroupMembership(windowId, targetGroups);
+  await ensureTabOrder(windowId, groupedTabIdsInOrder, groupedStartIndex);
 
   const skippedTabs = tabs.length - groupedTabs;
   let resultMessage = `已整理 ${groupedTabs} 个标签，整理成 ${groupCount} 个分组。`;
@@ -460,53 +464,8 @@ async function classifyTabBatchWithCloud(items, candidates, settings, isTest = f
     batchMode: "tabIds"
   };
 
-  const systemPrompt = [
-    "你是浏览器标签页分类器。",
-    "不要输出推理过程，不要逐项解释，不要先分析；直接输出最终 JSON。",
-    "你会收到当前窗口的每个标签页，以及本地规则预聚合出的候选组提示。你的任务是像人整理浏览器一样，一次性把所有标签页分成直觉上合理的组，并给最终分组智能命名。",
-    "本地候选组只是辅助线索，不是硬约束。你可以合并候选组，也可以把候选组里的某个 tab 单独移到更合适的组。",
-    "必须按以下多层机制判断：",
-    "1. 名字/标题层：优先看标题、搜索词、URL 路径里的主题、产品、技术栈、教程对象。不同网站但围绕同一对象的教程、下载、文档、源码、论坛讨论、视频，应合并为具体主题组，例如 Rime 输入法、Ollama、OpenAI API。",
-    "2. 功能上下文层：如果多个标签明显是在完成同一件事，例如安装、配置、部署、下载、阅读文档、查看 GitHub 项目或讨论同一工具，应归到该对象或对象+用途，而不是按网站类型分开。",
-    "3. 产品/站点域名层：preferredDomainGroup 表示官网、文档站、下载页或强站点名对应的产品/站点。它比泛化的网站属性更具体，但 GitHub、YouTube、哔哩哔哩、知乎、Reddit、Quora、Google、Bing、百度等来源平台名仍要继续看标题、URL 和 searchQuery。",
-    "4. 网站属性层：如果标题没有明确共同主题，再看网站属性，例如视频、代码、文档、邮箱、聊天、搜索、论坛、AI、购物、社交、新闻、金融、设计、办公。邮箱和聊天可以跨站合并；代码托管站点优先按具体仓库或项目，不要一概叫代码。",
-    "搜索引擎特殊规则：搜索页如果有 searchQuery，优先按搜索词指向的主题归类；只有搜索词无法和任何主题建立联系时，才归为搜索或具体搜索引擎。",
-    "论坛/问答特殊规则：Reddit、Quora、知乎、V2EX、贴吧、豆瓣、Hacker News 等如果讨论具体产品、技术或任务，应归到该主题；看不出主题时才归为论坛或站点名。",
-    "AI 产品规则：国内外 AI 工具和模型站点应尽量按产品名命名，例如 ChatGPT/OpenAI、Claude、DeepSeek、Kimi、通义千问、豆包、Gemini、Grok、Perplexity、Microsoft Copilot、腾讯元宝、腾讯混元、Mistral、Groq、Hugging Face、硅基流动、魔搭社区等。",
-    "5. 站点名层：如果仍不能判断，才使用站点名，例如 GitHub、Google Docs、哔哩哔哩、CSDN。",
-    "直觉规则：功能联系强时按具体主题分组；功能联系弱时按站点名或网站属性兜底。不要为了显得聪明而把无关内容硬合并。",
-    "智能命名要求：组名要具体、稳定、可复用；有具体主题时用主题名或主题+类别，不要用笼统的“教程”“文章”；有具体产品时用产品名，不要用网站类型。",
-    "不要把完整域名或域名后缀作为分组名，例如不要返回 bilibili.com、example.xyz、docs.example.co.uk。",
-    "分组名最长 12 个中文字符。必须覆盖每个输入 tabId，且每个 tabId 只能出现在一个返回组里。",
-    "输出必须是纯 JSON 对象，不能包含 Markdown、代码块、解释文字或前后缀。",
-    "唯一允许格式：{\"groups\":[{\"tabIds\":[1,2],\"group\":\"Rime 输入法\"}]}。"
-  ].join("\n");
-
-  const userPrompt = JSON.stringify({
-    rules: {
-      priority: ["functionalTopic", "titleTopic", "searchQueryTopic", "preferredDomainGroup", "siteProperty", "domainDisplayName"],
-      batchMode: "classifyEachTabThenMerge",
-      localCandidatesAreHintsOnly: true,
-      avoidDomainSuffixInGroupNames: true
-    },
-    tabs: items.map(createCloudBatchTab),
-    localCandidateHints: candidates.map((candidate) => ({
-      candidateId: candidate.candidateId,
-      tabIds: candidate.tabIds,
-      suggestedName: candidate.suggestedName,
-      confidence: candidate.confidence,
-      sampleTitles: candidate.sampleTitles,
-      intelligenceHints: candidate.intelligenceHints,
-      signals: {
-        functionalTopics: candidate.functionalTopics,
-        titleTopics: candidate.titleTopics,
-        searchQueryTopics: candidate.searchQueryTopics,
-        preferredDomainGroups: candidate.preferredDomainGroups,
-        siteProperties: candidate.siteProperties,
-        domainDisplayNames: candidate.domainDisplayNames
-      }
-    }))
-  });
+  const systemPrompt = buildCloudSystemPrompt();
+  const userPrompt = buildCloudUserPrompt(items, candidates);
 
   const resultGroups = await requestCloudGroups({
     settings,
@@ -520,17 +479,118 @@ async function classifyTabBatchWithCloud(items, candidates, settings, isTest = f
     throw new Error("API 返回成功，但没有 groups 分类结果。");
   }
 
-  const candidateById = new Map(candidates.map((candidate) => [candidate.candidateId, candidate]));
-  return resultGroups.flatMap((group) => {
-    const groupName = normalizeReturnedGroupName(group.group);
-    const tabIds = getTabIdsFromGroup(group, candidateById);
-    return tabIds
-      .map((tabId) => ({
-        tabId: Number(tabId),
-        group: groupName
-      }))
-      .filter((item) => Number.isFinite(item.tabId) && item.group);
+  return normalizeCloudAssignments(resultGroups, candidates, items);
+}
+
+function buildCloudSystemPrompt() {
+  return [
+    "你是浏览器标签页分类器。只输出最终 JSON，不要解释，不要 Markdown。",
+    "目标：按用户真实任务把标签页分组，并给稳定、可复用、具体的中文组名。",
+    "输入是本地规则生成的 candidates。优先以 candidateIds 合并候选组；只有候选组内部明显混入不同任务时，才用 tabIds 拆分。",
+    "判断优先级：functionalTopics > titleTopics/searchQueryTopics > preferredDomainGroups > siteProperties > domainDisplayNames。",
+    "强合并：同一产品、项目、仓库、技术栈、搜索词、安装/部署/配置/文档工作流，即使来自 GitHub、文档、视频、论坛、搜索，也应归到同一具体主题。",
+    "弱合并：只有来源平台相同但主题不同的内容不要硬合并；GitHub、YouTube、哔哩哔哩、知乎、Reddit、搜索结果要继续看标题、URL、searchQuery 和 hints。",
+    "命名：有产品/技术/任务就用它，例如 OpenAI API、Rime 输入法、Ollama 部署；没有明确主题再用站点名或属性。不要返回完整域名，组名最长 12 个中文字符。",
+    "覆盖：每个输入 tabId 最多出现一次。可省略无法判断的 tab，程序会用本地分类兜底。",
+    "json 输出要求：输出纯 JSON 对象。EXAMPLE JSON OUTPUT:",
+    "{\"groups\":[{\"candidateIds\":[\"c1\",\"c2\"],\"group\":\"OpenAI API\"},{\"tabIds\":[3],\"group\":\"GitHub\"}]}",
+    "唯一允许顶层格式：{\"groups\":[...]}。不要输出空 content。"
+  ].join("\n");
+}
+
+function buildCloudUserPrompt(items, candidates) {
+  const itemById = new Map(items.map((item) => [item.id, item]));
+  return JSON.stringify({
+    responseFormat: {
+      type: "json_object",
+      schema: { groups: [{ candidateIds: ["c1"], tabIds: [1], group: "具体组名" }] }
+    },
+    task: {
+      mode: "mergeCandidatesAndSplitOnlyWhenNeeded",
+      tabs: items.length,
+      candidates: candidates.length,
+      preferCandidateIds: true,
+      localFallbackWillFillMissingTabs: true
+    },
+    rules: {
+      mergeBy: ["sameFunctionalTopic", "sameTitleTopic", "sameSearchQueryTopic", "sameProductOrTech", "sameWorkflow"],
+      keepSeparateWhenOnlySameSource: ["GitHub", "YouTube", "哔哩哔哩", "知乎", "Reddit", "搜索"],
+      avoidNames: ["教程", "文章", "视频", "文档", "API", "代码", "AI", "搜索"],
+      avoidDomainSuffixInGroupNames: true,
+      maxGroupNameChineseChars: 12
+    },
+    candidates: candidates.map((candidate) => createCloudPromptCandidate(candidate, itemById))
   });
+}
+
+function createCloudPromptCandidate(candidate, itemById) {
+  return compactObject({
+    candidateId: candidate.candidateId,
+    tabIds: candidate.tabIds,
+    suggestedName: candidate.suggestedName,
+    confidence: candidate.confidence,
+    domains: candidate.domains,
+    signals: compactObject({
+      functionalTopics: candidate.functionalTopics,
+      titleTopics: candidate.titleTopics,
+      searchQueryTopics: candidate.searchQueryTopics,
+      preferredDomainGroups: candidate.preferredDomainGroups,
+      siteProperties: candidate.siteProperties,
+      domainDisplayNames: candidate.domainDisplayNames
+    }),
+    hints: candidate.intelligenceHints,
+    tabs: candidate.tabIds
+      .map((tabId) => itemById.get(tabId))
+      .filter(Boolean)
+      .map(createCloudPromptTab)
+  });
+}
+
+function createCloudPromptTab(item) {
+  return compactObject({
+    tabId: item.id,
+    title: truncateString(item.title || "", 100),
+    url: compactUrl(item.url || ""),
+    domain: item.domain,
+    searchQuery: item.searchQuery || "",
+    localFallback: item.localFallback,
+    signals: compactObject({
+      functionalTopic: item.functionalTopic,
+      titleTopic: item.titleTopic,
+      searchQueryTopic: item.searchQueryTopic,
+      preferredDomainGroup: item.preferredDomainGroup,
+      siteProperty: item.siteProperty,
+      domainDisplayName: item.domainDisplayName
+    })
+  });
+}
+
+function normalizeCloudAssignments(resultGroups, candidates, items) {
+  const candidateById = new Map(candidates.map((candidate) => [candidate.candidateId, candidate]));
+  const validTabIds = new Set(items.map((item) => Number(item.id)));
+  const assignedTabIds = new Set();
+  const assignments = [];
+
+  for (const group of resultGroups) {
+    const groupName = normalizeReturnedGroupName(group.group);
+    if (!groupName) {
+      continue;
+    }
+
+    for (const tabId of getTabIdsFromGroup(group, candidateById)) {
+      const normalizedTabId = Number(tabId);
+      if (!validTabIds.has(normalizedTabId) || assignedTabIds.has(normalizedTabId)) {
+        continue;
+      }
+      assignedTabIds.add(normalizedTabId);
+      assignments.push({
+        tabId: normalizedTabId,
+        group: groupName
+      });
+    }
+  }
+
+  return assignments;
 }
 
 async function requestCloudGroups({ settings, requestMeta, systemPrompt, userPrompt }) {
@@ -542,9 +602,9 @@ async function requestCloudGroups({ settings, requestMeta, systemPrompt, userPro
     "Content-Type": "application/json",
     Authorization: `Bearer ${settings.cloudApiKey.trim()}`
   };
+  const isDeepSeek = shouldUseDeepSeekJsonOptimizations(settings);
   const disableThinking = shouldSendThinkingDisable(settings);
-  const attempts = getCloudRequestAttempts(disableThinking);
-  let data;
+  const attempts = getCloudRequestAttempts({ disableThinking, preferJsonMode: isDeepSeek });
   let lastError;
   let skipJsonMode = false;
   let skipThinking = false;
@@ -558,31 +618,45 @@ async function requestCloudGroups({ settings, requestMeta, systemPrompt, userPro
       await appendLog("info", "发送云端请求", {
         ...requestMeta,
         jsonMode: attempt.useJsonMode,
-        thinkingDisabled: attempt.disableThinking
+        thinkingDisabled: attempt.disableThinking,
+        deepSeekJsonOptimized: isDeepSeek
       });
-      data = await postCloudJson(apiUrl, headers, buildCloudRequestBody({
+      const data = await postCloudJson(apiUrl, headers, buildCloudRequestBody({
         isResponsesEndpoint,
         model: settings.cloudModel.trim(),
         systemPrompt,
         userPrompt,
         useJsonMode: attempt.useJsonMode,
-        disableThinking: attempt.disableThinking
+        disableThinking: attempt.disableThinking,
+        maxOutputTokens: isDeepSeek ? CLOUD_DEEPSEEK_MAX_OUTPUT_TOKENS : CLOUD_MAX_OUTPUT_TOKENS,
+        temperature: isDeepSeek ? 0 : 0.1
       }));
-      break;
+      await appendLog("debug", "云端响应 JSON", data);
+      assertCloudCompletionUsable(data);
+      const content = extractModelContent(data);
+      await appendLog("ai", "AI 返回内容", content);
+      const parsed = parseModelJson(content);
+      const groups = normalizeResultGroups(parsed);
+      if (!groups.length) {
+        throw new Error("模型返回 JSON，但 groups 为空。");
+      }
+      return groups;
     } catch (error) {
       lastError = error;
       const jsonModeError = attempt.useJsonMode && isLikelyJsonModeError(error);
       const thinkingError = attempt.disableThinking && isLikelyThinkingParamError(error);
       const transientFetchError = isLikelyTransientFetchError(error);
-      if (!jsonModeError && !thinkingError && !transientFetchError) {
+      const retryableOutputError = isLikelyRetryableModelOutputError(error);
+      if (!jsonModeError && !thinkingError && !transientFetchError && !retryableOutputError) {
         throw error;
       }
-      skipJsonMode = skipJsonMode || jsonModeError || (transientFetchError && attempt.useJsonMode);
-      skipThinking = skipThinking || thinkingError || (transientFetchError && attempt.disableThinking);
-      await appendLog("warn", transientFetchError ? "云端网络层请求失败，准备换参数重试" : "云端请求参数不兼容，准备重试", {
+      skipJsonMode = skipJsonMode || jsonModeError;
+      skipThinking = skipThinking || thinkingError;
+      await appendLog("warn", getCloudRetryLogMessage({ transientFetchError, retryableOutputError }), {
         jsonMode: attempt.useJsonMode,
         thinkingDisabled: attempt.disableThinking,
         transientFetchError,
+        retryableOutputError,
         nextSkipJsonMode: skipJsonMode,
         nextSkipThinking: skipThinking,
         reason: normalizeError(error)
@@ -590,25 +664,23 @@ async function requestCloudGroups({ settings, requestMeta, systemPrompt, userPro
     }
   }
 
-  if (!data) {
-    throw lastError || new Error("云端请求失败。");
-  }
-
-  await appendLog("debug", "云端响应 JSON", data);
-  assertCloudCompletionUsable(data);
-  const content = extractModelContent(data);
-  await appendLog("ai", "AI 返回内容", content);
-  const parsed = parseModelJson(content);
-  return normalizeResultGroups(parsed);
+  throw lastError || new Error("云端请求失败。");
 }
 
-function getCloudRequestAttempts(disableThinking) {
-  const attempts = [
-    { useJsonMode: true, disableThinking },
-    { useJsonMode: false, disableThinking },
-    { useJsonMode: true, disableThinking: false },
-    { useJsonMode: false, disableThinking: false }
-  ];
+function getCloudRequestAttempts({ disableThinking, preferJsonMode = false }) {
+  const attempts = preferJsonMode
+    ? [
+        { useJsonMode: true, disableThinking },
+        { useJsonMode: true, disableThinking: false },
+        { useJsonMode: false, disableThinking },
+        { useJsonMode: false, disableThinking: false }
+      ]
+    : [
+        { useJsonMode: true, disableThinking },
+        { useJsonMode: false, disableThinking },
+        { useJsonMode: true, disableThinking: false },
+        { useJsonMode: false, disableThinking: false }
+      ];
   return attempts.filter((attempt, index, list) => {
     return index === list.findIndex((item) => {
       return item.useJsonMode === attempt.useJsonMode && item.disableThinking === attempt.disableThinking;
@@ -616,7 +688,7 @@ function getCloudRequestAttempts(disableThinking) {
   });
 }
 
-function buildCloudRequestBody({ isResponsesEndpoint, model, systemPrompt, userPrompt, useJsonMode, disableThinking }) {
+function buildCloudRequestBody({ isResponsesEndpoint, model, systemPrompt, userPrompt, useJsonMode, disableThinking, maxOutputTokens, temperature }) {
   const thinkingConfig = disableThinking ? { thinking: { type: "disabled" } } : {};
   if (isResponsesEndpoint) {
     return {
@@ -625,8 +697,8 @@ function buildCloudRequestBody({ isResponsesEndpoint, model, systemPrompt, userP
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt }
       ],
-      temperature: 0.1,
-      max_output_tokens: CLOUD_MAX_OUTPUT_TOKENS,
+      temperature,
+      max_output_tokens: maxOutputTokens,
       ...(useJsonMode ? { text: { format: { type: "json_object" } } } : {}),
       ...thinkingConfig
     };
@@ -638,8 +710,8 @@ function buildCloudRequestBody({ isResponsesEndpoint, model, systemPrompt, userP
       { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt }
     ],
-    temperature: 0.1,
-    max_tokens: CLOUD_MAX_OUTPUT_TOKENS,
+    temperature,
+    max_tokens: maxOutputTokens,
     ...(useJsonMode ? { response_format: { type: "json_object" } } : {}),
     ...thinkingConfig
   };
@@ -650,6 +722,11 @@ function shouldSendThinkingDisable(settings) {
     return false;
   }
 
+  const text = `${settings.cloudModel || ""} ${settings.cloudApiUrl || ""}`.toLowerCase();
+  return /\bdeepseek\b|deepseek-|deepseek_/.test(text);
+}
+
+function shouldUseDeepSeekJsonOptimizations(settings) {
   const text = `${settings.cloudModel || ""} ${settings.cloudApiUrl || ""}`.toLowerCase();
   return /\bdeepseek\b|deepseek-|deepseek_/.test(text);
 }
@@ -729,6 +806,21 @@ function isLikelyThinkingParamError(error) {
 function isLikelyTransientFetchError(error) {
   const message = normalizeError(error).toLowerCase();
   return isRawTransientFetchError(error) || /请求失败:.*(?:failed to fetch|networkerror|load failed|network request failed)/i.test(message);
+}
+
+function isLikelyRetryableModelOutputError(error) {
+  const message = normalizeError(error);
+  return /无法读取模型返回内容|模型没有返回可解析的 JSON|输出 token 消耗在 reasoning_content|JSON 字符串被中途截断|groups 为空/i.test(message);
+}
+
+function getCloudRetryLogMessage({ transientFetchError, retryableOutputError }) {
+  if (transientFetchError) {
+    return "云端网络层请求失败，准备重试";
+  }
+  if (retryableOutputError) {
+    return "云端返回内容不稳定，准备重试";
+  }
+  return "云端请求参数不兼容，准备重试";
 }
 
 function isRawTransientFetchError(error) {
@@ -819,6 +911,9 @@ function extractTextFromContentParts(content) {
 }
 
 function parseModelJson(text) {
+  if (looksLikeTruncatedJson(text)) {
+    throw new Error("模型返回的 JSON 字符串被中途截断。");
+  }
   const candidates = getJsonCandidates(text);
   for (const candidate of candidates) {
     const parsed = tryParseJson(candidate);
@@ -827,6 +922,14 @@ function parseModelJson(text) {
     }
   }
   throw new Error("模型没有返回可解析的 JSON。");
+}
+
+function looksLikeTruncatedJson(text) {
+  const raw = String(text || "").trim();
+  if (!raw || !/^[{\[]/.test(raw)) {
+    return false;
+  }
+  return !extractBalancedJson(raw, raw[0], raw[0] === "{" ? "}" : "]");
 }
 
 function getJsonCandidates(text) {
@@ -1295,7 +1398,18 @@ function extractPathTopicHint(url) {
 
 function compactObject(object) {
   return Object.fromEntries(
-    Object.entries(object).filter(([, value]) => Boolean(value))
+    Object.entries(object).filter(([, value]) => {
+      if (!value) {
+        return false;
+      }
+      if (Array.isArray(value)) {
+        return value.length > 0;
+      }
+      if (typeof value === "object") {
+        return Object.keys(value).length > 0;
+      }
+      return true;
+    })
   );
 }
 
@@ -1968,6 +2082,71 @@ async function ensureGroupMembership(windowId, groupSpecs) {
   }
 }
 
+async function ensureTabOrder(windowId, tabIds, startIndex) {
+  const orderedTabIds = uniqueFiniteTabIds(tabIds);
+  if (!orderedTabIds.length || !Number.isFinite(startIndex)) {
+    return;
+  }
+
+  let lastState = null;
+  for (let attempt = 1; attempt <= TAB_MOVE_MAX_VERIFY_ATTEMPTS; attempt += 1) {
+    await moveTabIds(orderedTabIds, startIndex);
+    await delay(TAB_MOVE_SETTLE_DELAY_MS);
+
+    const state = await getTabOrderState(windowId, orderedTabIds, startIndex);
+    lastState = state;
+    if (state.ok) {
+      if (attempt > 1) {
+        await appendLog("info", "标签移动已校准", {
+          attempt,
+          startIndex,
+          tabIds: orderedTabIds
+        });
+      }
+      return;
+    }
+
+    await appendLog("warn", "标签移动后位置未完全落地，准备重试", {
+      attempt,
+      startIndex,
+      expectedTabIds: orderedTabIds,
+      actualTabIds: state.actualTabIds,
+      actualIndexes: state.actualIndexes
+    });
+  }
+
+  await moveTabIdsOneByOne(orderedTabIds, startIndex);
+  await delay(TAB_MOVE_SETTLE_DELAY_MS);
+  const finalState = await getTabOrderState(windowId, orderedTabIds, startIndex);
+  if (!finalState.ok) {
+    await appendLog("warn", "标签移动仍未完全对齐，已保留 Chrome 当前状态", {
+      startIndex,
+      expectedTabIds: orderedTabIds,
+      actualTabIds: finalState.actualTabIds,
+      actualIndexes: finalState.actualIndexes,
+      previousActualTabIds: lastState?.actualTabIds || []
+    });
+  }
+}
+
+async function getTabOrderState(windowId, expectedTabIds, startIndex) {
+  const expectedSet = new Set(expectedTabIds);
+  const tabs = (await queryTabs({ windowId })).sort((left, right) => left.index - right.index);
+  const actualTabs = tabs.filter((tab) => expectedSet.has(tab.id));
+  const actualTabIds = actualTabs.map((tab) => tab.id);
+  const actualIndexes = actualTabs.map((tab) => tab.index);
+  const expectedIndexes = expectedTabIds.map((_, offset) => startIndex + offset);
+  const ok = actualTabIds.length === expectedTabIds.length
+    && actualTabIds.every((tabId, index) => tabId === expectedTabIds[index])
+    && actualIndexes.every((tabIndex, index) => tabIndex === expectedIndexes[index]);
+
+  return {
+    ok,
+    actualTabIds,
+    actualIndexes
+  };
+}
+
 function moveTabIds(tabIds, index) {
   return new Promise((resolve, reject) => {
     if (!tabIds.length || !Number.isFinite(index)) {
@@ -1983,6 +2162,25 @@ function moveTabIds(tabIds, index) {
       }
     });
   });
+}
+
+async function moveTabIdsOneByOne(tabIds, startIndex) {
+  for (let offset = 0; offset < tabIds.length; offset += 1) {
+    await moveTabIds([tabIds[offset]], startIndex + offset);
+  }
+}
+
+function uniqueFiniteTabIds(tabIds) {
+  const seen = new Set();
+  return tabIds
+    .map((tabId) => Number(tabId))
+    .filter((tabId) => {
+      if (!Number.isFinite(tabId) || seen.has(tabId)) {
+        return false;
+      }
+      seen.add(tabId);
+      return true;
+    });
 }
 
 function ungroupTabIds(tabIds) {
